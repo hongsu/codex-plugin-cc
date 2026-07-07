@@ -12,6 +12,7 @@ export const PID_FILE_ENV = "CODEX_COMPANION_APP_SERVER_PID_FILE";
 export const LOG_FILE_ENV = "CODEX_COMPANION_APP_SERVER_LOG_FILE";
 const BROKER_STATE_FILE = "broker.json";
 const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
+export const SESSION_PID_ENV = "CODEX_COMPANION_SESSION_PID";
 const BROKER_STATE_LOCK_STALE_MS = 30000;
 const BROKER_STATE_LOCK_TIMEOUT_MS = 5000;
 const BROKER_SHUTDOWN_TIMEOUT_MS = 1000;
@@ -22,6 +23,15 @@ export function resolveSessionId(options = {}) {
   }
   const env = options.env ?? process.env;
   return env[SESSION_ID_ENV] ?? null;
+}
+
+export function resolveSessionPid(options = {}) {
+  if (Number.isInteger(options.sessionPid) && options.sessionPid > 0) {
+    return options.sessionPid;
+  }
+  const env = options.env ?? process.env;
+  const parsed = Number.parseInt(env[SESSION_PID_ENV] ?? "", 10);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
 }
 
 function brokerSessionOwners(session) {
@@ -35,11 +45,55 @@ function brokerSessionOwners(session) {
   return [...new Set(owners.filter(Boolean))];
 }
 
-export function hasBrokerSessionOwners(session) {
-  return brokerSessionOwners(session).length > 0;
+function brokerSessionOwnerPids(session) {
+  return session?.sessionPids && typeof session.sessionPids === "object" ? session.sessionPids : {};
 }
 
-function withBrokerSessionOwner(session, sessionId) {
+function isProcessAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
+
+// Owners without a recorded pid have no liveness signal and are assumed alive
+// (legacy broker.json files keep their pre-pid behavior).
+function isBrokerSessionOwnerLive(session, owner) {
+  const pid = brokerSessionOwnerPids(session)[owner];
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return true;
+  }
+  return isProcessAlive(pid);
+}
+
+export function hasLiveBrokerSessionOwners(session) {
+  return brokerSessionOwners(session).some((owner) => isBrokerSessionOwnerLive(session, owner));
+}
+
+function brokerSessionWithOwners(session, owners) {
+  const pids = brokerSessionOwnerPids(session);
+  const keptPids = {};
+  for (const owner of owners) {
+    if (Number.isInteger(pids[owner]) && pids[owner] > 0) {
+      keptPids[owner] = pids[owner];
+    }
+  }
+  const next = {
+    ...session,
+    sessionId: owners[0] ?? null,
+    sessionIds: owners
+  };
+  if (Object.keys(keptPids).length > 0) {
+    next.sessionPids = keptPids;
+  } else {
+    delete next.sessionPids;
+  }
+  return next;
+}
+
+function withBrokerSessionOwner(session, sessionId, sessionPid = null) {
   if (!sessionId) {
     return session;
   }
@@ -47,11 +101,11 @@ function withBrokerSessionOwner(session, sessionId) {
   if (!owners.includes(sessionId)) {
     owners.push(sessionId);
   }
-  return {
-    ...session,
-    sessionId: owners[0] ?? sessionId,
-    sessionIds: owners
-  };
+  const next = brokerSessionWithOwners({ ...session }, owners);
+  if (Number.isInteger(sessionPid) && sessionPid > 0) {
+    next.sessionPids = { ...brokerSessionOwnerPids(next), [sessionId]: sessionPid };
+  }
+  return next;
 }
 
 async function sleep(ms) {
@@ -217,7 +271,7 @@ export async function ensureBrokerSession(cwd, options = {}) {
     const stateFile = resolveBrokerStateFile(cwd);
     return await withBrokerStateFileLock(stateFile, () => {
       const current = loadBrokerSession(cwd) ?? existing;
-      const withOwner = withBrokerSessionOwner(current, resolveSessionId(options));
+      const withOwner = withBrokerSessionOwner(current, resolveSessionId(options), resolveSessionPid(options));
       if (withOwner !== current) {
         saveBrokerSession(cwd, withOwner);
       }
@@ -276,7 +330,7 @@ export async function ensureBrokerSession(cwd, options = {}) {
     pid: child.pid ?? null,
     sessionId: resolveSessionId(options)
   };
-  const withOwner = withBrokerSessionOwner(session, session.sessionId);
+  const withOwner = withBrokerSessionOwner(session, session.sessionId, resolveSessionPid(options));
   saveBrokerSession(cwd, withOwner);
   return withOwner;
 }
@@ -312,11 +366,16 @@ export async function teardownBrokersForSession(sessionId, { killProcess = null,
       if (!owners.includes(sessionId)) {
         return;
       }
-      const remainingOwners = owners.filter((owner) => owner !== sessionId);
+      // Drop the ending owner, then prune co-owners whose recorded session pid
+      // is gone — a session that died without SessionEnd must not keep the
+      // broker alive forever (see #380 / #108).
+      const remainingOwners = owners
+        .filter((owner) => owner !== sessionId)
+        .filter((owner) => isBrokerSessionOwnerLive(session, owner));
       if (remainingOwners.length > 0) {
         fs.writeFileSync(
           stateFile,
-          `${JSON.stringify({ ...session, sessionId: remainingOwners[0], sessionIds: remainingOwners }, null, 2)}\n`,
+          `${JSON.stringify(brokerSessionWithOwners(session, remainingOwners), null, 2)}\n`,
           "utf8"
         );
         return;
