@@ -9,12 +9,11 @@ import { terminateProcessTree } from "./lib/process.mjs";
 import { BROKER_ENDPOINT_ENV } from "./lib/app-server.mjs";
 import {
   clearBrokerSession,
-  hasLiveBrokerSessionOwners,
+  hasBrokerSessionOwners,
   LOG_FILE_ENV,
   loadBrokerSession,
   PID_FILE_ENV,
   sendBrokerShutdown,
-  SESSION_PID_ENV,
   teardownBrokerSession,
   teardownBrokersForSession
 } from "./lib/broker-lifecycle.mjs";
@@ -81,11 +80,6 @@ function cleanupSessionJobs(cwd, sessionId) {
 
 function handleSessionStart(input) {
   appendEnvVar(SESSION_ID_ENV, input.session_id);
-  // Best-effort liveness anchor for broker ownership: the hook's parent is the
-  // Claude process (hook commands are exec'd), which lives exactly as long as
-  // the session. If the capture is ever wrong, owners just look dead and broker
-  // teardown degrades to the pre-ownership behavior.
-  appendEnvVar(SESSION_PID_ENV, process.ppid);
   appendEnvVar(TRANSCRIPT_PATH_ENV, input.transcript_path);
   appendEnvVar(PLUGIN_DATA_ENV, process.env[PLUGIN_DATA_ENV]);
 }
@@ -113,7 +107,7 @@ export async function handleSessionEnd(input) {
           logFile: process.env[LOG_FILE_ENV] ?? null
         }
       : null);
-  if (sessionId && hasLiveBrokerSessionOwners(brokerSession)) {
+  if (sessionId && hasBrokerSessionOwners(brokerSession)) {
     if (cleanupError) {
       throw cleanupError;
     }

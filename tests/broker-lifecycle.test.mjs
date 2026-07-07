@@ -2,7 +2,7 @@ import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { spawn, spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { pathToFileURL } from "node:url";
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -14,17 +14,10 @@ import {
   ensureBrokerSession,
   loadBrokerSession,
   resolveSessionId,
-  resolveSessionPid,
   saveBrokerSession,
   teardownBrokersForSession
 } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import { handleSessionEnd } from "../plugins/codex/scripts/session-lifecycle-hook.mjs";
-
-function deadPid() {
-  const result = spawnSync(process.execPath, ["-e", ""]);
-  assert.equal(result.status, 0);
-  return result.pid;
-}
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -441,107 +434,74 @@ test("teardownBrokersForSession times out unresponsive broker shutdown requests"
   });
 });
 
-test("resolveSessionPid prefers explicit option, then env, then null", () => {
-  assert.equal(resolveSessionPid({ sessionPid: 4321 }), 4321);
-  assert.equal(resolveSessionPid({ env: { CODEX_COMPANION_SESSION_PID: "1234" } }), 1234);
-  assert.equal(resolveSessionPid({ env: { CODEX_COMPANION_SESSION_PID: "not-a-pid" } }), null);
-  assert.equal(resolveSessionPid({ env: {} }), null);
-});
-
-test("teardownBrokersForSession prunes a dead co-owner and tears down the broker", async () => {
+test("teardownBrokersForSession skips a locked entry but still tears down the session's other brokers", async () => {
   await withPluginData(async () => {
     await withReadyBroker(async ({ endpoint, requests, sessionDir }) => {
       const stateRoot = stateRootForTest();
-      const gonePid = deadPid();
-      const brokerJson = writeBrokerJson(stateRoot, "worktree-deadowner01dead", {
-        endpoint,
-        pidFile: null,
-        logFile: null,
-        sessionDir,
-        pid: null,
-        sessionId: "DEAD",
-        sessionIds: ["DEAD", "B"],
-        sessionPids: { DEAD: gonePid }
+
+      // Entry 1: a fresh, held lock (a concurrent hook that never released it).
+      const lockedJson = writeBrokerJson(stateRoot, "worktree-lockedaaaaaaaa", {
+        endpoint: "unix:/tmp/codex-test-locked.sock",
+        pidFile: null, logFile: null, sessionDir: null, pid: null, sessionId: "S"
+      });
+      fs.mkdirSync(`${lockedJson}.lock`);
+
+      // Entry 2: a real broker owned by the same session, later in the scan.
+      const cleanableJson = writeBrokerJson(stateRoot, "worktree-cleanablebbbb", {
+        endpoint, pidFile: null, logFile: null, sessionDir, pid: null, sessionId: "S"
       });
 
-      // DEAD's session pid is gone, so B is effectively the last live owner:
-      // its SessionEnd must shut the broker down instead of leaving it behind.
-      const count = await teardownBrokersForSession("B", { killProcess: () => {} });
-
-      assert.equal(count, 1);
-      assert.equal(fs.existsSync(brokerJson), false);
-      assert.equal(requests.length, 1);
+      try {
+        const count = await teardownBrokersForSession("S", { killProcess: () => {}, lockTimeoutMs: 60 });
+        // The locked entry is skipped (not aborted), the reachable one is cleaned.
+        assert.equal(count, 1);
+        assert.equal(fs.existsSync(cleanableJson), false);
+        assert.equal(fs.existsSync(lockedJson), true);
+        assert.equal(requests.length, 1);
+      } finally {
+        fs.rmSync(`${lockedJson}.lock`, { recursive: true, force: true });
+      }
     });
   });
 });
 
-test("teardownBrokersForSession keeps a live co-owner and its recorded pid", async () => {
-  await withPluginData(async () => {
-    const stateRoot = stateRootForTest();
-    const brokerJson = writeBrokerJson(stateRoot, "worktree-liveowner1live", {
-      endpoint: "unix:/tmp/codex-test-nonexistent5.sock",
-      pidFile: null,
-      logFile: null,
-      sessionDir: null,
-      pid: null,
-      sessionId: "LIVE",
-      sessionIds: ["LIVE", "B"],
-      sessionPids: { LIVE: process.pid }
-    });
-
-    const count = await teardownBrokersForSession("B", { killProcess: () => {} });
-
-    assert.equal(count, 0);
-    const session = JSON.parse(fs.readFileSync(brokerJson, "utf8"));
-    assert.equal(session.sessionId, "LIVE");
-    assert.deepEqual(session.sessionIds, ["LIVE"]);
-    assert.deepEqual(session.sessionPids, { LIVE: process.pid });
-  });
-});
-
-test("handleSessionEnd falls through to cwd teardown when the only recorded owner is dead", async () => {
+test("ensureBrokerSession spawns and persists a fresh broker when the recorded one is dead", async () => {
   await withPluginData(async () => {
     const cwd = makeTempDir();
-    const gonePid = deadPid();
     saveBrokerSession(cwd, {
-      endpoint: "unix:/tmp/codex-test-nonexistent6.sock",
+      endpoint: "unix:/tmp/codex-test-dead-spawn.sock",
       pidFile: null,
       logFile: null,
       sessionDir: null,
       pid: null,
-      sessionId: "DEAD",
-      sessionIds: ["DEAD"],
-      sessionPids: { DEAD: gonePid }
+      sessionId: "A",
+      sessionIds: ["A"]
     });
 
-    // The ending session never owned this broker, but its sole owner's session
-    // pid is gone — the legacy cwd path must reclaim it rather than early-return.
-    await handleSessionEnd({ cwd, session_id: "OTHER" });
-
-    assert.equal(loadBrokerSession(cwd), null);
-  });
-});
-
-test("ensureBrokerSession records the reusing session's pid for liveness checks", async () => {
-  await withPluginData(async () => {
-    await withReadyBroker(async ({ endpoint, sessionDir }) => {
-      const cwd = makeTempDir();
-      saveBrokerSession(cwd, {
-        endpoint,
-        pidFile: null,
-        logFile: null,
-        sessionDir,
-        pid: null,
-        sessionId: "A"
-      });
-
-      const reused = await ensureBrokerSession(cwd, {
-        env: { CODEX_COMPANION_SESSION_ID: "B", CODEX_COMPANION_SESSION_PID: String(process.pid) }
-      });
-
-      assert.deepEqual(reused.sessionIds, ["A", "B"]);
-      assert.deepEqual(loadBrokerSession(cwd).sessionPids, { B: process.pid });
+    const session = await ensureBrokerSession(cwd, {
+      env: { CODEX_COMPANION_SESSION_ID: "B" },
+      scriptPath: writeFakeBrokerScript()
     });
+    try {
+      assert.ok(session);
+      assert.notEqual(session.endpoint, "unix:/tmp/codex-test-dead-spawn.sock");
+      assert.deepEqual(session.sessionIds, ["B"]);
+      // The freshly spawned broker is the one persisted (no orphan record).
+      assert.equal(loadBrokerSession(cwd).endpoint, session.endpoint);
+      assert.equal(await new Promise((resolve) => {
+        const socket = net.createConnection({ path: parseBrokerEndpoint(session.endpoint).path });
+        socket.on("connect", () => { socket.end(); resolve(true); });
+        socket.on("error", () => resolve(false));
+      }), true);
+    } finally {
+      if (session?.pid) {
+        try {
+          process.kill(session.pid);
+        } catch {
+          // Already gone.
+        }
+      }
+    }
   });
 });
 

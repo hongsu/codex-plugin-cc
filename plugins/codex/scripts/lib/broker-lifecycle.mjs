@@ -12,10 +12,12 @@ export const PID_FILE_ENV = "CODEX_COMPANION_APP_SERVER_PID_FILE";
 export const LOG_FILE_ENV = "CODEX_COMPANION_APP_SERVER_LOG_FILE";
 const BROKER_STATE_FILE = "broker.json";
 const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
-export const SESSION_PID_ENV = "CODEX_COMPANION_SESSION_PID";
 const BROKER_STATE_LOCK_STALE_MS = 30000;
 const BROKER_STATE_LOCK_TIMEOUT_MS = 5000;
 const BROKER_SHUTDOWN_TIMEOUT_MS = 1000;
+const BROKER_LOCK_TIMEOUT_CODE = "EBROKERSTATELOCKTIMEOUT";
+
+let brokerLockTokenSeq = 0;
 
 export function resolveSessionId(options = {}) {
   if (options.sessionId) {
@@ -23,15 +25,6 @@ export function resolveSessionId(options = {}) {
   }
   const env = options.env ?? process.env;
   return env[SESSION_ID_ENV] ?? null;
-}
-
-export function resolveSessionPid(options = {}) {
-  if (Number.isInteger(options.sessionPid) && options.sessionPid > 0) {
-    return options.sessionPid;
-  }
-  const env = options.env ?? process.env;
-  const parsed = Number.parseInt(env[SESSION_PID_ENV] ?? "", 10);
-  return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
 }
 
 function brokerSessionOwners(session) {
@@ -45,55 +38,11 @@ function brokerSessionOwners(session) {
   return [...new Set(owners.filter(Boolean))];
 }
 
-function brokerSessionOwnerPids(session) {
-  return session?.sessionPids && typeof session.sessionPids === "object" ? session.sessionPids : {};
+export function hasBrokerSessionOwners(session) {
+  return brokerSessionOwners(session).length > 0;
 }
 
-function isProcessAlive(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return error?.code === "EPERM";
-  }
-}
-
-// Owners without a recorded pid have no liveness signal and are assumed alive
-// (legacy broker.json files keep their pre-pid behavior).
-function isBrokerSessionOwnerLive(session, owner) {
-  const pid = brokerSessionOwnerPids(session)[owner];
-  if (!Number.isInteger(pid) || pid <= 0) {
-    return true;
-  }
-  return isProcessAlive(pid);
-}
-
-export function hasLiveBrokerSessionOwners(session) {
-  return brokerSessionOwners(session).some((owner) => isBrokerSessionOwnerLive(session, owner));
-}
-
-function brokerSessionWithOwners(session, owners) {
-  const pids = brokerSessionOwnerPids(session);
-  const keptPids = {};
-  for (const owner of owners) {
-    if (Number.isInteger(pids[owner]) && pids[owner] > 0) {
-      keptPids[owner] = pids[owner];
-    }
-  }
-  const next = {
-    ...session,
-    sessionId: owners[0] ?? null,
-    sessionIds: owners
-  };
-  if (Object.keys(keptPids).length > 0) {
-    next.sessionPids = keptPids;
-  } else {
-    delete next.sessionPids;
-  }
-  return next;
-}
-
-function withBrokerSessionOwner(session, sessionId, sessionPid = null) {
+function withBrokerSessionOwner(session, sessionId) {
   if (!sessionId) {
     return session;
   }
@@ -101,19 +50,25 @@ function withBrokerSessionOwner(session, sessionId, sessionPid = null) {
   if (!owners.includes(sessionId)) {
     owners.push(sessionId);
   }
-  const next = brokerSessionWithOwners({ ...session }, owners);
-  if (Number.isInteger(sessionPid) && sessionPid > 0) {
-    next.sessionPids = { ...brokerSessionOwnerPids(next), [sessionId]: sessionPid };
-  }
-  return next;
+  return {
+    ...session,
+    sessionId: owners[0] ?? sessionId,
+    sessionIds: owners
+  };
 }
 
 async function sleep(ms) {
   await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function isBrokerLockTimeout(error) {
+  return error?.code === BROKER_LOCK_TIMEOUT_CODE;
+}
+
 async function withBrokerStateFileLock(stateFile, fn, options = {}) {
   const lockDir = `${stateFile}.lock`;
+  const tokenFile = path.join(lockDir, "owner");
+  const token = `${process.pid}-${brokerLockTokenSeq += 1}`;
   const timeoutMs = options.timeoutMs ?? BROKER_STATE_LOCK_TIMEOUT_MS;
   const staleMs = options.staleMs ?? BROKER_STATE_LOCK_STALE_MS;
   const deadline = Date.now() + timeoutMs;
@@ -136,16 +91,34 @@ async function withBrokerStateFileLock(stateFile, fn, options = {}) {
         continue;
       }
       if (Date.now() >= deadline) {
-        throw new Error(`Timed out waiting for broker state lock: ${stateFile}`);
+        const timeout = new Error(`Timed out waiting for broker state lock: ${stateFile}`);
+        timeout.code = BROKER_LOCK_TIMEOUT_CODE;
+        throw timeout;
       }
       await sleep(25);
     }
   }
 
+  // Stamp ownership so the finally only releases a lock we still hold — a
+  // stale reclaim by another waiter must not have its lock deleted from under it.
+  try {
+    fs.writeFileSync(tokenFile, token, "utf8");
+  } catch {
+    // Non-fatal: fall back to unconditional release below.
+  }
+
   try {
     return await fn();
   } finally {
-    fs.rmSync(lockDir, { recursive: true, force: true });
+    let owned = true;
+    try {
+      owned = fs.readFileSync(tokenFile, "utf8") === token;
+    } catch {
+      owned = false;
+    }
+    if (owned) {
+      fs.rmSync(lockDir, { recursive: true, force: true });
+    }
   }
 }
 
@@ -265,47 +238,10 @@ async function isBrokerEndpointReady(endpoint) {
   }
 }
 
-export async function ensureBrokerSession(cwd, options = {}) {
-  const stateFile = resolveBrokerStateFile(cwd);
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    const existing = loadBrokerSession(cwd);
-    if (!existing || !(await isBrokerEndpointReady(existing.endpoint))) {
-      break;
-    }
-    // The readiness probe ran outside the lock, so the broker may have been
-    // torn down (or replaced) before we acquired it. Only reuse what the
-    // locked re-read shows; never resurrect the pre-lock snapshot.
-    const reused = await withBrokerStateFileLock(stateFile, () => {
-      const current = loadBrokerSession(cwd);
-      if (!current || current.endpoint !== existing.endpoint) {
-        return null;
-      }
-      const withOwner = withBrokerSessionOwner(current, resolveSessionId(options), resolveSessionPid(options));
-      if (withOwner !== current) {
-        saveBrokerSession(cwd, withOwner);
-      }
-      return withOwner;
-    });
-    if (reused) {
-      return reused;
-    }
-    // State changed while we waited for the lock — re-probe: a replacement
-    // broker may already be live and reusable.
-  }
-
-  const stale = loadBrokerSession(cwd);
-  if (stale) {
-    teardownBrokerSession({
-      endpoint: stale.endpoint ?? null,
-      pidFile: stale.pidFile ?? null,
-      logFile: stale.logFile ?? null,
-      sessionDir: stale.sessionDir ?? null,
-      pid: stale.pid ?? null,
-      killProcess: options.killProcess ?? null
-    });
-    clearBrokerSession(cwd);
-  }
-
+// Spawn a broker process and wait for it to accept connections. Returns an
+// unsaved session record, or null if it never became ready. No locking or
+// persistence — the caller owns those.
+async function spawnReadyBroker(cwd, options) {
   const sessionDir = createBrokerSessionDir();
   const endpointFactory = options.createBrokerEndpoint ?? createBrokerEndpoint;
   const endpoint = endpointFactory(sessionDir, options.platform);
@@ -337,7 +273,7 @@ export async function ensureBrokerSession(cwd, options = {}) {
     return null;
   }
 
-  const session = {
+  return {
     endpoint,
     pidFile,
     logFile,
@@ -345,12 +281,118 @@ export async function ensureBrokerSession(cwd, options = {}) {
     pid: child.pid ?? null,
     sessionId: resolveSessionId(options)
   };
-  const withOwner = withBrokerSessionOwner(session, session.sessionId, resolveSessionPid(options));
+}
+
+// Tear down whatever broker is recorded for cwd (best effort) so a fresh one
+// can replace it.
+function discardBrokerSession(cwd, session, options) {
+  if (!session) {
+    return;
+  }
+  teardownBrokerSession({
+    endpoint: session.endpoint ?? null,
+    pidFile: session.pidFile ?? null,
+    logFile: session.logFile ?? null,
+    sessionDir: session.sessionDir ?? null,
+    pid: session.pid ?? null,
+    killProcess: options.killProcess ?? null
+  });
+  clearBrokerSession(cwd);
+}
+
+// Adopt cwd's recorded broker for this session if it is still live, else spawn
+// and persist a fresh one. Callers run this inside the state-file lock so two
+// racing sessions cannot each leave an orphaned broker with no broker.json.
+async function adoptOrSpawnBroker(cwd, options) {
+  const current = loadBrokerSession(cwd);
+  if (current && (await isBrokerEndpointReady(current.endpoint))) {
+    const withOwner = withBrokerSessionOwner(current, resolveSessionId(options));
+    if (withOwner !== current) {
+      saveBrokerSession(cwd, withOwner);
+    }
+    return withOwner;
+  }
+  discardBrokerSession(cwd, current, options);
+
+  const session = await spawnReadyBroker(cwd, options);
+  if (!session) {
+    return null;
+  }
+  const withOwner = withBrokerSessionOwner(session, session.sessionId);
   saveBrokerSession(cwd, withOwner);
   return withOwner;
 }
 
-export async function teardownBrokersForSession(sessionId, { killProcess = null, shutdownTimeoutMs = BROKER_SHUTDOWN_TIMEOUT_MS } = {}) {
+export async function ensureBrokerSession(cwd, options = {}) {
+  const stateFile = resolveBrokerStateFile(cwd);
+
+  // Fast path: reuse a ready broker. The readiness probe runs outside the lock,
+  // so the broker may have been torn down (or replaced) before we acquired it;
+  // trust only the locked re-read, never the pre-lock snapshot.
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const existing = loadBrokerSession(cwd);
+    if (!existing || !(await isBrokerEndpointReady(existing.endpoint))) {
+      break;
+    }
+    let lockUnavailable = false;
+    const reused = await withBrokerStateFileLock(stateFile, () => {
+      const current = loadBrokerSession(cwd);
+      if (!current || current.endpoint !== existing.endpoint) {
+        return null;
+      }
+      const withOwner = withBrokerSessionOwner(current, resolveSessionId(options));
+      if (withOwner !== current) {
+        saveBrokerSession(cwd, withOwner);
+      }
+      return withOwner;
+    }).catch((error) => {
+      if (isBrokerLockTimeout(error)) {
+        lockUnavailable = true;
+        return null;
+      }
+      throw error;
+    });
+    if (reused) {
+      return reused;
+    }
+    if (lockUnavailable) {
+      break;
+    }
+    // State changed while we waited for the lock — re-probe: a replacement
+    // broker may already be live and reusable.
+  }
+
+  // Slow path: adopt-or-spawn under the lock so concurrent spawns don't orphan
+  // brokers. resolveStateDir must exist before we can create the lock dir.
+  fs.mkdirSync(resolveStateDir(cwd), { recursive: true });
+  let lockUnavailable = false;
+  const created = await withBrokerStateFileLock(stateFile, () => adoptOrSpawnBroker(cwd, options)).catch((error) => {
+    if (isBrokerLockTimeout(error)) {
+      lockUnavailable = true;
+      return null;
+    }
+    throw error;
+  });
+  if (!lockUnavailable) {
+    return created;
+  }
+
+  // Lock stayed busy past the timeout: spawn without it rather than block
+  // starting Codex. Rare, and degrades only to the pre-lock race window.
+  discardBrokerSession(cwd, loadBrokerSession(cwd), options);
+  const session = await spawnReadyBroker(cwd, options);
+  if (!session) {
+    return null;
+  }
+  const withOwner = withBrokerSessionOwner(session, session.sessionId);
+  saveBrokerSession(cwd, withOwner);
+  return withOwner;
+}
+
+export async function teardownBrokersForSession(
+  sessionId,
+  { killProcess = null, shutdownTimeoutMs = BROKER_SHUTDOWN_TIMEOUT_MS, lockTimeoutMs = BROKER_STATE_LOCK_TIMEOUT_MS } = {}
+) {
   if (!sessionId) {
     return 0;
   }
@@ -366,52 +408,60 @@ export async function teardownBrokersForSession(sessionId, { killProcess = null,
       continue;
     }
 
-    await withBrokerStateFileLock(stateFile, async () => {
-      if (!fs.existsSync(stateFile)) {
-        return;
-      }
+    try {
+      await withBrokerStateFileLock(
+        stateFile,
+        async () => {
+          if (!fs.existsSync(stateFile)) {
+            return;
+          }
 
-      let session;
-      try {
-        session = JSON.parse(fs.readFileSync(stateFile, "utf8"));
-      } catch {
-        return;
-      }
-      const owners = brokerSessionOwners(session);
-      if (!owners.includes(sessionId)) {
-        return;
-      }
-      // Drop the ending owner, then prune co-owners whose recorded session pid
-      // is gone — a session that died without SessionEnd must not keep the
-      // broker alive forever (see #380 / #108).
-      const remainingOwners = owners
-        .filter((owner) => owner !== sessionId)
-        .filter((owner) => isBrokerSessionOwnerLive(session, owner));
-      if (remainingOwners.length > 0) {
-        fs.writeFileSync(
-          stateFile,
-          `${JSON.stringify(brokerSessionWithOwners(session, remainingOwners), null, 2)}\n`,
-          "utf8"
-        );
-        return;
-      }
+          let session;
+          try {
+            session = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+          } catch {
+            return;
+          }
+          const owners = brokerSessionOwners(session);
+          if (!owners.includes(sessionId)) {
+            return;
+          }
+          const remainingOwners = owners.filter((owner) => owner !== sessionId);
+          if (remainingOwners.length > 0) {
+            fs.writeFileSync(
+              stateFile,
+              `${JSON.stringify({ ...session, sessionId: remainingOwners[0], sessionIds: remainingOwners }, null, 2)}\n`,
+              "utf8"
+            );
+            return;
+          }
 
-      if (session.endpoint) {
-        await sendBrokerShutdown(session.endpoint, { timeoutMs: shutdownTimeoutMs });
+          if (session.endpoint) {
+            await sendBrokerShutdown(session.endpoint, { timeoutMs: shutdownTimeoutMs });
+          }
+          teardownBrokerSession({
+            endpoint: session.endpoint ?? null,
+            pidFile: session.pidFile ?? null,
+            logFile: session.logFile ?? null,
+            sessionDir: session.sessionDir ?? null,
+            pid: session.pid ?? null,
+            killProcess
+          });
+          if (fs.existsSync(stateFile)) {
+            fs.unlinkSync(stateFile);
+          }
+          count += 1;
+        },
+        { timeoutMs: lockTimeoutMs }
+      );
+    } catch (error) {
+      if (!isBrokerLockTimeout(error)) {
+        throw error;
       }
-      teardownBrokerSession({
-        endpoint: session.endpoint ?? null,
-        pidFile: session.pidFile ?? null,
-        logFile: session.logFile ?? null,
-        sessionDir: session.sessionDir ?? null,
-        pid: session.pid ?? null,
-        killProcess
-      });
-      if (fs.existsSync(stateFile)) {
-        fs.unlinkSync(stateFile);
-      }
-      count += 1;
-    });
+      // Another hook holds this entry's lock and did not release it within the
+      // timeout. Skip it so the rest of this session's brokers still get torn
+      // down instead of aborting the whole scan.
+    }
   }
   return count;
 }
