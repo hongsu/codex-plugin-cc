@@ -162,8 +162,14 @@ function isExecutedDirectly() {
     return false;
   }
 
-  return fs.realpathSync(fileURLToPath(import.meta.url)) ===
-    fs.realpathSync(path.resolve(process.argv[1]));
+  try {
+    return fs.realpathSync(fileURLToPath(import.meta.url)) ===
+      fs.realpathSync(path.resolve(process.argv[1]));
+  } catch {
+    // argv[1] may not resolve to a real path (deleted file, loader indirection);
+    // importing must never crash at module load.
+    return false;
+  }
 }
 
 // Only run main() when executed directly (not when imported by tests).
