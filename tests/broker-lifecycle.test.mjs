@@ -26,6 +26,30 @@ function deadPid() {
   return result.pid;
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Minimal stand-in for app-server-broker.mjs: honors the spawn contract
+// (serve --endpoint --cwd --pid-file) enough for waitForBrokerEndpoint.
+const FAKE_BROKER_SCRIPT = `import fs from "node:fs";
+import net from "node:net";
+
+const args = process.argv.slice(2);
+const get = (name) => args[args.indexOf(name) + 1];
+const sockPath = get("--endpoint").replace(/^unix:/, "");
+const server = net.createServer((socket) => socket.end());
+server.listen(sockPath, () => {
+  fs.writeFileSync(get("--pid-file"), String(process.pid), "utf8");
+});
+`;
+
+function writeFakeBrokerScript() {
+  const scriptPath = path.join(makeTempDir(), "fake-broker.mjs");
+  fs.writeFileSync(scriptPath, FAKE_BROKER_SCRIPT, "utf8");
+  return scriptPath;
+}
+
 const stateRootForTest = resolveStateRoot;
 
 test("resolveStateRoot uses CLAUDE_PLUGIN_DATA/state when set", () => {
@@ -517,6 +541,94 @@ test("ensureBrokerSession records the reusing session's pid for liveness checks"
 
       assert.deepEqual(reused.sessionIds, ["A", "B"]);
       assert.deepEqual(loadBrokerSession(cwd).sessionPids, { B: process.pid });
+    });
+  });
+});
+
+test("ensureBrokerSession does not resurrect a broker torn down while waiting for the state lock", async () => {
+  await withPluginData(async () => {
+    await withReadyBroker(async ({ endpoint, sessionDir }) => {
+      const cwd = makeTempDir();
+      saveBrokerSession(cwd, {
+        endpoint,
+        pidFile: null,
+        logFile: null,
+        sessionDir,
+        pid: null,
+        sessionId: "A",
+        sessionIds: ["A"]
+      });
+      const stateFile = path.join(resolveStateDir(cwd), "broker.json");
+      fs.mkdirSync(`${stateFile}.lock`);
+
+      const pending = ensureBrokerSession(cwd, {
+        env: { CODEX_COMPANION_SESSION_ID: "B" },
+        scriptPath: writeFakeBrokerScript()
+      });
+
+      // While B is parked on the lock (readiness probe already passed), A's
+      // SessionEnd shuts the broker down and removes broker.json.
+      await sleep(200);
+      fs.unlinkSync(stateFile);
+      fs.rmSync(parseBrokerEndpoint(endpoint).path, { force: true });
+      fs.rmdirSync(`${stateFile}.lock`);
+
+      const session = await pending;
+      try {
+        assert.ok(session);
+        assert.notEqual(session.endpoint, endpoint);
+        assert.deepEqual(session.sessionIds, ["B"]);
+        assert.equal(loadBrokerSession(cwd).endpoint, session.endpoint);
+      } finally {
+        if (session?.pid) {
+          try {
+            process.kill(session.pid);
+          } catch {
+            // Already gone.
+          }
+        }
+      }
+    });
+  });
+});
+
+test("ensureBrokerSession reuses a live replacement broker after losing the lock race", async () => {
+  await withPluginData(async () => {
+    await withReadyBroker(async ({ endpoint: staleEndpoint, sessionDir: staleDir }) => {
+      await withReadyBroker(async ({ endpoint: freshEndpoint, sessionDir: freshDir }) => {
+        const cwd = makeTempDir();
+        saveBrokerSession(cwd, {
+          endpoint: staleEndpoint,
+          pidFile: null,
+          logFile: null,
+          sessionDir: staleDir,
+          pid: null,
+          sessionId: "A",
+          sessionIds: ["A"]
+        });
+        const stateFile = path.join(resolveStateDir(cwd), "broker.json");
+        fs.mkdirSync(`${stateFile}.lock`);
+
+        const pending = ensureBrokerSession(cwd, { env: { CODEX_COMPANION_SESSION_ID: "B" } });
+
+        // While B waits, the stale broker is replaced by a different live one.
+        await sleep(200);
+        saveBrokerSession(cwd, {
+          endpoint: freshEndpoint,
+          pidFile: null,
+          logFile: null,
+          sessionDir: freshDir,
+          pid: null,
+          sessionId: "C",
+          sessionIds: ["C"]
+        });
+        fs.rmdirSync(`${stateFile}.lock`);
+
+        const session = await pending;
+        assert.equal(session.endpoint, freshEndpoint);
+        assert.deepEqual(session.sessionIds, ["C", "B"]);
+        assert.deepEqual(loadBrokerSession(cwd).sessionIds, ["C", "B"]);
+      });
     });
   });
 });

@@ -266,26 +266,41 @@ async function isBrokerEndpointReady(endpoint) {
 }
 
 export async function ensureBrokerSession(cwd, options = {}) {
-  const existing = loadBrokerSession(cwd);
-  if (existing && (await isBrokerEndpointReady(existing.endpoint))) {
-    const stateFile = resolveBrokerStateFile(cwd);
-    return await withBrokerStateFileLock(stateFile, () => {
-      const current = loadBrokerSession(cwd) ?? existing;
+  const stateFile = resolveBrokerStateFile(cwd);
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const existing = loadBrokerSession(cwd);
+    if (!existing || !(await isBrokerEndpointReady(existing.endpoint))) {
+      break;
+    }
+    // The readiness probe ran outside the lock, so the broker may have been
+    // torn down (or replaced) before we acquired it. Only reuse what the
+    // locked re-read shows; never resurrect the pre-lock snapshot.
+    const reused = await withBrokerStateFileLock(stateFile, () => {
+      const current = loadBrokerSession(cwd);
+      if (!current || current.endpoint !== existing.endpoint) {
+        return null;
+      }
       const withOwner = withBrokerSessionOwner(current, resolveSessionId(options), resolveSessionPid(options));
       if (withOwner !== current) {
         saveBrokerSession(cwd, withOwner);
       }
       return withOwner;
     });
+    if (reused) {
+      return reused;
+    }
+    // State changed while we waited for the lock — re-probe: a replacement
+    // broker may already be live and reusable.
   }
 
-  if (existing) {
+  const stale = loadBrokerSession(cwd);
+  if (stale) {
     teardownBrokerSession({
-      endpoint: existing.endpoint ?? null,
-      pidFile: existing.pidFile ?? null,
-      logFile: existing.logFile ?? null,
-      sessionDir: existing.sessionDir ?? null,
-      pid: existing.pid ?? null,
+      endpoint: stale.endpoint ?? null,
+      pidFile: stale.pidFile ?? null,
+      logFile: stale.logFile ?? null,
+      sessionDir: stale.sessionDir ?? null,
+      pid: stale.pid ?? null,
       killProcess: options.killProcess ?? null
     });
     clearBrokerSession(cwd);
