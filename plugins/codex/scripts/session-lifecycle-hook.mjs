@@ -87,7 +87,13 @@ function handleSessionStart(input) {
 export async function handleSessionEnd(input) {
   const cwd = input.cwd || process.cwd();
   const sessionId = input.session_id || process.env[SESSION_ID_ENV];
-  cleanupSessionJobs(cwd, sessionId);
+  let cleanupError = null;
+  try {
+    cleanupSessionJobs(cwd, sessionId);
+  } catch (error) {
+    cleanupError = error;
+  }
+
   if (sessionId) {
     await teardownBrokersForSession(sessionId, { killProcess: terminateProcessTree });
   }
@@ -102,6 +108,9 @@ export async function handleSessionEnd(input) {
         }
       : null);
   if (sessionId && hasBrokerSessionOwners(brokerSession)) {
+    if (cleanupError) {
+      throw cleanupError;
+    }
     return;
   }
   const brokerEndpoint = brokerSession?.endpoint ?? null;
@@ -123,6 +132,9 @@ export async function handleSessionEnd(input) {
     killProcess: terminateProcessTree
   });
   clearBrokerSession(cwd);
+  if (cleanupError) {
+    throw cleanupError;
+  }
 }
 
 async function main() {

@@ -12,6 +12,9 @@ export const PID_FILE_ENV = "CODEX_COMPANION_APP_SERVER_PID_FILE";
 export const LOG_FILE_ENV = "CODEX_COMPANION_APP_SERVER_LOG_FILE";
 const BROKER_STATE_FILE = "broker.json";
 const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
+const BROKER_STATE_LOCK_STALE_MS = 30000;
+const BROKER_STATE_LOCK_TIMEOUT_MS = 5000;
+const BROKER_SHUTDOWN_TIMEOUT_MS = 1000;
 
 export function resolveSessionId(options = {}) {
   if (options.sessionId) {
@@ -51,6 +54,47 @@ function withBrokerSessionOwner(session, sessionId) {
   };
 }
 
+async function sleep(ms) {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function withBrokerStateFileLock(stateFile, fn, options = {}) {
+  const lockDir = `${stateFile}.lock`;
+  const timeoutMs = options.timeoutMs ?? BROKER_STATE_LOCK_TIMEOUT_MS;
+  const staleMs = options.staleMs ?? BROKER_STATE_LOCK_STALE_MS;
+  const deadline = Date.now() + timeoutMs;
+
+  while (true) {
+    try {
+      fs.mkdirSync(lockDir);
+      break;
+    } catch (error) {
+      if (error?.code !== "EEXIST") {
+        throw error;
+      }
+      try {
+        const stat = fs.statSync(lockDir);
+        if (Date.now() - stat.mtimeMs > staleMs) {
+          fs.rmSync(lockDir, { recursive: true, force: true });
+          continue;
+        }
+      } catch {
+        continue;
+      }
+      if (Date.now() >= deadline) {
+        throw new Error(`Timed out waiting for broker state lock: ${stateFile}`);
+      }
+      await sleep(25);
+    }
+  }
+
+  try {
+    return await fn();
+  } finally {
+    fs.rmSync(lockDir, { recursive: true, force: true });
+  }
+}
+
 export function createBrokerSessionDir(prefix = "cxc-") {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }
@@ -79,19 +123,37 @@ export async function waitForBrokerEndpoint(endpoint, timeoutMs = 2000) {
   return false;
 }
 
-export async function sendBrokerShutdown(endpoint) {
+export async function sendBrokerShutdown(endpoint, { timeoutMs = BROKER_SHUTDOWN_TIMEOUT_MS } = {}) {
   await new Promise((resolve) => {
+    let settled = false;
+    let timer = null;
     const socket = connectToEndpoint(endpoint);
+    const finish = () => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      if (timer) {
+        clearTimeout(timer);
+      }
+      resolve();
+    };
+    if (timeoutMs > 0) {
+      timer = setTimeout(() => {
+        socket.destroy();
+        finish();
+      }, timeoutMs);
+    }
     socket.setEncoding("utf8");
     socket.on("connect", () => {
       socket.write(`${JSON.stringify({ id: 1, method: "broker/shutdown", params: {} })}\n`);
     });
     socket.on("data", () => {
       socket.end();
-      resolve();
+      finish();
     });
-    socket.on("error", resolve);
-    socket.on("close", resolve);
+    socket.on("error", finish);
+    socket.on("close", finish);
   });
 }
 
@@ -152,11 +214,15 @@ async function isBrokerEndpointReady(endpoint) {
 export async function ensureBrokerSession(cwd, options = {}) {
   const existing = loadBrokerSession(cwd);
   if (existing && (await isBrokerEndpointReady(existing.endpoint))) {
-    const withOwner = withBrokerSessionOwner(existing, resolveSessionId(options));
-    if (withOwner !== existing) {
-      saveBrokerSession(cwd, withOwner);
-    }
-    return withOwner;
+    const stateFile = resolveBrokerStateFile(cwd);
+    return await withBrokerStateFileLock(stateFile, () => {
+      const current = loadBrokerSession(cwd) ?? existing;
+      const withOwner = withBrokerSessionOwner(current, resolveSessionId(options));
+      if (withOwner !== current) {
+        saveBrokerSession(cwd, withOwner);
+      }
+      return withOwner;
+    });
   }
 
   if (existing) {
@@ -215,7 +281,7 @@ export async function ensureBrokerSession(cwd, options = {}) {
   return withOwner;
 }
 
-export async function teardownBrokersForSession(sessionId, { killProcess = null } = {}) {
+export async function teardownBrokersForSession(sessionId, { killProcess = null, shutdownTimeoutMs = BROKER_SHUTDOWN_TIMEOUT_MS } = {}) {
   if (!sessionId) {
     return 0;
   }
@@ -231,41 +297,47 @@ export async function teardownBrokersForSession(sessionId, { killProcess = null 
       continue;
     }
 
-    let session;
-    try {
-      session = JSON.parse(fs.readFileSync(stateFile, "utf8"));
-    } catch {
-      continue;
-    }
-    const owners = brokerSessionOwners(session);
-    if (!owners.includes(sessionId)) {
-      continue;
-    }
-    const remainingOwners = owners.filter((owner) => owner !== sessionId);
-    if (remainingOwners.length > 0) {
-      fs.writeFileSync(
-        stateFile,
-        `${JSON.stringify({ ...session, sessionId: remainingOwners[0], sessionIds: remainingOwners }, null, 2)}\n`,
-        "utf8"
-      );
-      continue;
-    }
+    await withBrokerStateFileLock(stateFile, async () => {
+      if (!fs.existsSync(stateFile)) {
+        return;
+      }
 
-    if (session.endpoint) {
-      await sendBrokerShutdown(session.endpoint);
-    }
-    teardownBrokerSession({
-      endpoint: session.endpoint ?? null,
-      pidFile: session.pidFile ?? null,
-      logFile: session.logFile ?? null,
-      sessionDir: session.sessionDir ?? null,
-      pid: session.pid ?? null,
-      killProcess
+      let session;
+      try {
+        session = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+      } catch {
+        return;
+      }
+      const owners = brokerSessionOwners(session);
+      if (!owners.includes(sessionId)) {
+        return;
+      }
+      const remainingOwners = owners.filter((owner) => owner !== sessionId);
+      if (remainingOwners.length > 0) {
+        fs.writeFileSync(
+          stateFile,
+          `${JSON.stringify({ ...session, sessionId: remainingOwners[0], sessionIds: remainingOwners }, null, 2)}\n`,
+          "utf8"
+        );
+        return;
+      }
+
+      if (session.endpoint) {
+        await sendBrokerShutdown(session.endpoint, { timeoutMs: shutdownTimeoutMs });
+      }
+      teardownBrokerSession({
+        endpoint: session.endpoint ?? null,
+        pidFile: session.pidFile ?? null,
+        logFile: session.logFile ?? null,
+        sessionDir: session.sessionDir ?? null,
+        pid: session.pid ?? null,
+        killProcess
+      });
+      if (fs.existsSync(stateFile)) {
+        fs.unlinkSync(stateFile);
+      }
+      count += 1;
     });
-    if (fs.existsSync(stateFile)) {
-      fs.unlinkSync(stateFile);
-    }
-    count += 1;
   }
   return count;
 }

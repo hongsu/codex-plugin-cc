@@ -2,12 +2,14 @@ import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { spawn } from "node:child_process";
+import { pathToFileURL } from "node:url";
 import test from "node:test";
 import assert from "node:assert/strict";
 
 import { makeTempDir } from "./helpers.mjs";
 import { createBrokerEndpoint, parseBrokerEndpoint } from "../plugins/codex/scripts/lib/broker-endpoint.mjs";
-import { resolveStateRoot } from "../plugins/codex/scripts/lib/state.mjs";
+import { resolveStateDir, resolveStateRoot } from "../plugins/codex/scripts/lib/state.mjs";
 import {
   ensureBrokerSession,
   loadBrokerSession,
@@ -112,6 +114,51 @@ async function withReadyBroker(fn) {
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }
+}
+
+async function withHangingBroker(fn) {
+  const sessionDir = makeTempDir();
+  const endpoint = createBrokerEndpoint(sessionDir);
+  const target = parseBrokerEndpoint(endpoint);
+  const requests = [];
+  const sockets = [];
+  const server = net.createServer((socket) => {
+    sockets.push(socket);
+    socket.setEncoding("utf8");
+    socket.on("data", (chunk) => {
+      requests.push(chunk);
+    });
+  });
+
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(target.path, () => {
+      server.off("error", reject);
+      resolve();
+    });
+  });
+
+  const destroySockets = () => {
+    for (const socket of sockets) {
+      socket.destroy();
+    }
+  };
+
+  try {
+    return await fn({ endpoint, requests, sessionDir, destroySockets });
+  } finally {
+    destroySockets();
+    await new Promise((resolve) => server.close(resolve));
+  }
+}
+
+function waitForChild(child) {
+  return new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("exit", (code, signal) => {
+      resolve({ code, signal });
+    });
+  });
 }
 
 test("teardownBrokersForSession tears down a broker registered for a different cwd", async () => {
@@ -227,6 +274,138 @@ test("handleSessionEnd removes only the ending owner from a shared cwd broker", 
       assert.equal(loadBrokerSession(cwd).sessionId, "B");
       assert.deepEqual(loadBrokerSession(cwd).sessionIds, ["B"]);
       assert.equal(requests.length, 0);
+    });
+  });
+});
+
+test("concurrent SessionEnd hooks tear down a shared broker after the last owner exits", async () => {
+  await withPluginData(async (pluginData) => {
+    await withReadyBroker(async ({ endpoint, requests, sessionDir }) => {
+      const cwd = makeTempDir();
+      const markerDir = makeTempDir();
+      const pidFile = path.join(sessionDir, "broker.pid");
+      const logFile = path.join(sessionDir, "broker.log");
+      fs.writeFileSync(pidFile, "12345\n");
+      fs.writeFileSync(logFile, "");
+      const brokerJson = writeBrokerJson(stateRootForTest(), "worktree-race-deadbeef", {
+        endpoint,
+        pidFile,
+        logFile,
+        sessionDir,
+        pid: 12345,
+        sessionId: "A",
+        sessionIds: ["A", "B"]
+      });
+
+      const moduleUrl = pathToFileURL(path.resolve("plugins/codex/scripts/lib/broker-lifecycle.mjs")).href;
+      const script = `
+        import fs from "node:fs";
+        import path from "node:path";
+
+        const stateFile = process.env.TEST_BROKER_STATE_FILE;
+        const markerDir = process.env.TEST_MARKER_DIR;
+        const sessionId = process.env.TEST_SESSION_ID;
+        const otherSessionId = sessionId === "A" ? "B" : "A";
+        const originalWriteFileSync = fs.writeFileSync.bind(fs);
+
+        fs.writeFileSync = (file, data, ...args) => {
+          if (file === stateFile && String(data).includes('"sessionIds"')) {
+            originalWriteFileSync(path.join(markerDir, sessionId + ".ready"), "", "utf8");
+            const otherReady = path.join(markerDir, otherSessionId + ".ready");
+            const deadline = Date.now() + 500;
+            while (!fs.existsSync(otherReady) && Date.now() < deadline) {}
+          }
+          return originalWriteFileSync(file, data, ...args);
+        };
+
+        const { teardownBrokersForSession } = await import(process.env.TEST_BROKER_MODULE_URL);
+        await teardownBrokersForSession(sessionId, { killProcess: () => {} });
+      `;
+
+      const makeChild = (sessionId) =>
+        spawn(process.execPath, ["--input-type=module", "-e", script], {
+          cwd: path.resolve("."),
+          env: {
+            ...process.env,
+            CLAUDE_PLUGIN_DATA: pluginData,
+            TEST_BROKER_STATE_FILE: brokerJson,
+            TEST_BROKER_MODULE_URL: moduleUrl,
+            TEST_MARKER_DIR: markerDir,
+            TEST_SESSION_ID: sessionId
+          },
+          stdio: ["ignore", "pipe", "pipe"]
+        });
+
+      const childA = makeChild("A");
+      const childB = makeChild("B");
+      const [resultA, resultB] = await Promise.all([waitForChild(childA), waitForChild(childB)]);
+
+      assert.deepEqual([resultA.code, resultB.code], [0, 0]);
+      assert.equal(fs.existsSync(brokerJson), false);
+      assert.equal(requests.length, 1);
+    });
+  });
+});
+
+test("handleSessionEnd still tears down session brokers when job cleanup fails", async () => {
+  await withPluginData(async () => {
+    const cwd = makeTempDir();
+    const workspaceStateDir = resolveStateDir(cwd);
+    saveBrokerSession(cwd, {
+      endpoint: "unix:/tmp/codex-test-nonexistent-cleanup.sock",
+      pidFile: null,
+      logFile: null,
+      sessionDir: null,
+      pid: null,
+      sessionId: "S",
+      sessionIds: ["S"]
+    });
+    const badLogFile = path.join(workspaceStateDir, "bad.log");
+    fs.mkdirSync(badLogFile);
+    const stateFile = path.join(workspaceStateDir, "state.json");
+    fs.writeFileSync(
+      stateFile,
+      `${JSON.stringify({
+        version: 1,
+        config: { stopReviewGate: false },
+        jobs: [{ id: "completed", status: "completed", sessionId: "S", logFile: badLogFile }]
+      }, null, 2)}\n`,
+      "utf8"
+    );
+
+    await assert.rejects(() => handleSessionEnd({ cwd, session_id: "S" }), { code: "EISDIR" });
+    assert.equal(fs.existsSync(path.join(workspaceStateDir, "broker.json")), false);
+  });
+});
+
+test("teardownBrokersForSession times out unresponsive broker shutdown requests", async () => {
+  await withPluginData(async () => {
+    await withHangingBroker(async ({ endpoint, requests, sessionDir, destroySockets }) => {
+      const stateRoot = stateRootForTest();
+      const brokerJson = writeBrokerJson(stateRoot, "hanging-shutdown-deadbeef", {
+        endpoint,
+        pidFile: null,
+        logFile: null,
+        sessionDir,
+        pid: null,
+        sessionId: "S",
+        sessionIds: ["S"]
+      });
+
+      let completed = false;
+      const teardown = teardownBrokersForSession("S", { killProcess: () => {}, shutdownTimeoutMs: 50 })
+        .then(() => {
+          completed = true;
+        });
+      try {
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        assert.equal(completed, true);
+      } finally {
+        destroySockets();
+        await teardown;
+      }
+      assert.equal(fs.existsSync(brokerJson), false);
+      assert.equal(requests.length, 1);
     });
   });
 });
