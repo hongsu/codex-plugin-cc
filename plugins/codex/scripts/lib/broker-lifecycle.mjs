@@ -38,8 +38,12 @@ function brokerSessionOwners(session) {
   return [...new Set(owners.filter(Boolean))];
 }
 
-export function hasBrokerSessionOwners(session) {
-  return brokerSessionOwners(session).length > 0;
+// True when the broker is still owned by a session other than `sessionId`.
+// Used by SessionEnd to decide whether the cwd fallback must still run: if the
+// only remaining owner is the ending session (e.g. its session-keyed teardown
+// was skipped under lock contention), the broker must NOT be left behind.
+export function hasOtherBrokerSessionOwners(session, sessionId) {
+  return brokerSessionOwners(session).some((owner) => owner !== sessionId);
 }
 
 function withBrokerSessionOwner(session, sessionId) {
@@ -84,7 +88,27 @@ async function withBrokerStateFileLock(stateFile, fn, options = {}) {
       try {
         const stat = fs.statSync(lockDir);
         if (Date.now() - stat.mtimeMs > staleMs) {
-          fs.rmSync(lockDir, { recursive: true, force: true });
+          // Reclaim atomically: rename the stale directory to a private name so
+          // only one reclaimer can take it — a blind rmSync lets two reclaimers
+          // each delete the other's freshly created lock. After the rename,
+          // re-check the mtime: if the directory we grabbed was refreshed after
+          // our stat (a fresh lock, not the stale one), put it back untouched.
+          const claimed = `${lockDir}.reclaim-${process.pid}-${(brokerLockTokenSeq += 1)}`;
+          try {
+            fs.renameSync(lockDir, claimed);
+            if (Date.now() - fs.statSync(claimed).mtimeMs > staleMs) {
+              fs.rmSync(claimed, { recursive: true, force: true });
+            } else {
+              try {
+                fs.renameSync(claimed, lockDir);
+              } catch {
+                // A new lock already took the path; drop the moved copy.
+                fs.rmSync(claimed, { recursive: true, force: true });
+              }
+            }
+          } catch {
+            // Lost the reclaim race; fall through and retry acquisition.
+          }
           continue;
         }
       } catch {
@@ -101,20 +125,25 @@ async function withBrokerStateFileLock(stateFile, fn, options = {}) {
 
   // Stamp ownership so the finally only releases a lock we still hold — a
   // stale reclaim by another waiter must not have its lock deleted from under it.
+  let stamped = false;
   try {
     fs.writeFileSync(tokenFile, token, "utf8");
+    stamped = true;
   } catch {
-    // Non-fatal: fall back to unconditional release below.
+    // Could not stamp (quota/permission race). We still created the lock dir,
+    // so release it unconditionally below rather than leaking it.
   }
 
   try {
     return await fn();
   } finally {
     let owned = true;
-    try {
-      owned = fs.readFileSync(tokenFile, "utf8") === token;
-    } catch {
-      owned = false;
+    if (stamped) {
+      try {
+        owned = fs.readFileSync(tokenFile, "utf8") === token;
+      } catch {
+        owned = false;
+      }
     }
     if (owned) {
       fs.rmSync(lockDir, { recursive: true, force: true });
@@ -377,21 +406,22 @@ export async function ensureBrokerSession(cwd, options = {}) {
     return created;
   }
 
-  // Lock stayed busy past the timeout: spawn without it rather than block
-  // starting Codex. Rare, and degrades only to the pre-lock race window.
-  discardBrokerSession(cwd, loadBrokerSession(cwd), options);
-  const session = await spawnReadyBroker(cwd, options);
-  if (!session) {
-    return null;
-  }
-  const withOwner = withBrokerSessionOwner(session, session.sessionId);
-  saveBrokerSession(cwd, withOwner);
-  return withOwner;
+  // Lock stayed busy past the timeout: proceed without it rather than block
+  // starting Codex. adopt-or-spawn still reuses a live recorded broker (and
+  // only discards one that fails its readiness probe), so a long-held lock
+  // never causes another session's live broker to be unlinked/orphaned. Rare,
+  // and degrades only to the pre-lock race window.
+  return adoptOrSpawnBroker(cwd, options);
 }
 
 export async function teardownBrokersForSession(
   sessionId,
-  { killProcess = null, shutdownTimeoutMs = BROKER_SHUTDOWN_TIMEOUT_MS, lockTimeoutMs = BROKER_STATE_LOCK_TIMEOUT_MS } = {}
+  {
+    killProcess = null,
+    shutdownTimeoutMs = BROKER_SHUTDOWN_TIMEOUT_MS,
+    lockTimeoutMs = BROKER_STATE_LOCK_TIMEOUT_MS,
+    budgetMs = null
+  } = {}
 ) {
   if (!sessionId) {
     return 0;
@@ -401,12 +431,36 @@ export async function teardownBrokersForSession(
     return 0;
   }
 
+  const deadline = budgetMs != null ? Date.now() + budgetMs : null;
   let count = 0;
   for (const entry of fs.readdirSync(stateRoot)) {
+    if (deadline != null && Date.now() >= deadline) {
+      break;
+    }
     const stateFile = path.join(stateRoot, entry, BROKER_STATE_FILE);
     if (!fs.existsSync(stateFile)) {
       continue;
     }
+
+    // Ownership pre-check without the lock: never block on a lock held for a
+    // workspace this session does not own. The owner set only ever grows to
+    // include our sessionId (reuse) or shrinks when we ourselves remove it, so
+    // an unlocked read cannot falsely exclude a broker we own.
+    let preview;
+    try {
+      preview = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+    } catch {
+      continue;
+    }
+    if (!brokerSessionOwners(preview).includes(sessionId)) {
+      continue;
+    }
+
+    const remaining = deadline != null ? deadline - Date.now() : lockTimeoutMs;
+    if (remaining <= 0) {
+      break;
+    }
+    const entryLockTimeout = Math.min(lockTimeoutMs, remaining);
 
     try {
       await withBrokerStateFileLock(
@@ -436,8 +490,17 @@ export async function teardownBrokersForSession(
             return;
           }
 
+          // Bound the graceful-shutdown wait by the remaining scan budget, not
+          // just the per-RPC default: several unresponsive endpoints could
+          // otherwise each burn shutdownTimeoutMs and push the whole scan past
+          // the SessionEnd hook's budget. Out of budget → skip the RPC and let
+          // teardownBrokerSession terminate the process directly.
           if (session.endpoint) {
-            await sendBrokerShutdown(session.endpoint, { timeoutMs: shutdownTimeoutMs });
+            const shutdownWait =
+              deadline != null ? Math.min(shutdownTimeoutMs, deadline - Date.now()) : shutdownTimeoutMs;
+            if (shutdownWait > 0) {
+              await sendBrokerShutdown(session.endpoint, { timeoutMs: shutdownWait });
+            }
           }
           teardownBrokerSession({
             endpoint: session.endpoint ?? null,
@@ -452,7 +515,7 @@ export async function teardownBrokersForSession(
           }
           count += 1;
         },
-        { timeoutMs: lockTimeoutMs }
+        { timeoutMs: entryLockTimeout }
       );
     } catch (error) {
       if (!isBrokerLockTimeout(error)) {

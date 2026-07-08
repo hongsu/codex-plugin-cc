@@ -9,7 +9,7 @@ import { terminateProcessTree } from "./lib/process.mjs";
 import { BROKER_ENDPOINT_ENV } from "./lib/app-server.mjs";
 import {
   clearBrokerSession,
-  hasBrokerSessionOwners,
+  hasOtherBrokerSessionOwners,
   LOG_FILE_ENV,
   loadBrokerSession,
   PID_FILE_ENV,
@@ -23,6 +23,12 @@ import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
 const PLUGIN_DATA_ENV = "CLAUDE_PLUGIN_DATA";
+// hooks.json gives the SessionEnd hook a 5s budget. Keep the session-keyed
+// broker scan well under it — a short per-entry lock wait plus a total scan
+// deadline — so a single contended broker.json.lock cannot starve the rest of
+// cleanup before the hook is killed.
+const SESSION_END_TEARDOWN_BUDGET_MS = 3000;
+const SESSION_END_LOCK_TIMEOUT_MS = 750;
 
 function readHookInput() {
   const raw = fs.readFileSync(0, "utf8").trim();
@@ -95,7 +101,11 @@ export async function handleSessionEnd(input) {
   }
 
   if (sessionId) {
-    await teardownBrokersForSession(sessionId, { killProcess: terminateProcessTree });
+    await teardownBrokersForSession(sessionId, {
+      killProcess: terminateProcessTree,
+      lockTimeoutMs: SESSION_END_LOCK_TIMEOUT_MS,
+      budgetMs: SESSION_END_TEARDOWN_BUDGET_MS
+    });
   }
 
   const brokerSession =
@@ -107,7 +117,7 @@ export async function handleSessionEnd(input) {
           logFile: process.env[LOG_FILE_ENV] ?? null
         }
       : null);
-  if (sessionId && hasBrokerSessionOwners(brokerSession)) {
+  if (sessionId && hasOtherBrokerSessionOwners(brokerSession, sessionId)) {
     if (cleanupError) {
       throw cleanupError;
     }

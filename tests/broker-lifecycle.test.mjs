@@ -434,12 +434,13 @@ test("teardownBrokersForSession times out unresponsive broker shutdown requests"
   });
 });
 
-test("teardownBrokersForSession skips a locked entry but still tears down the session's other brokers", async () => {
+test("teardownBrokersForSession skips a same-session locked entry but tears down the rest", async () => {
   await withPluginData(async () => {
     await withReadyBroker(async ({ endpoint, requests, sessionDir }) => {
       const stateRoot = stateRootForTest();
 
-      // Entry 1: a fresh, held lock (a concurrent hook that never released it).
+      // Entry 1: owned by this session but its lock is held by a concurrent hook
+      // that never released it.
       const lockedJson = writeBrokerJson(stateRoot, "worktree-lockedaaaaaaaa", {
         endpoint: "unix:/tmp/codex-test-locked.sock",
         pidFile: null, logFile: null, sessionDir: null, pid: null, sessionId: "S"
@@ -462,6 +463,96 @@ test("teardownBrokersForSession skips a locked entry but still tears down the se
         fs.rmSync(`${lockedJson}.lock`, { recursive: true, force: true });
       }
     });
+  });
+});
+
+test("teardownBrokersForSession never waits on a lock for another session's workspace", async () => {
+  await withPluginData(async () => {
+    await withReadyBroker(async ({ endpoint, requests, sessionDir }) => {
+      const stateRoot = stateRootForTest();
+
+      // An unrelated workspace with a held lock, ordered before ours.
+      const otherJson = writeBrokerJson(stateRoot, "worktree-0000otheraaaa", {
+        endpoint: "unix:/tmp/codex-test-other.sock",
+        pidFile: null, logFile: null, sessionDir: null, pid: null, sessionId: "OTHER"
+      });
+      fs.mkdirSync(`${otherJson}.lock`);
+
+      const ourJson = writeBrokerJson(stateRoot, "worktree-9999oursbbbbb", {
+        endpoint, pidFile: null, logFile: null, sessionDir, pid: null, sessionId: "S"
+      });
+
+      try {
+        const startedAt = Date.now();
+        // A large per-entry lock timeout would stall for seconds if we waited on
+        // the unrelated lock; the ownership pre-check must skip it outright.
+        const count = await teardownBrokersForSession("S", { killProcess: () => {}, lockTimeoutMs: 5000 });
+        const elapsed = Date.now() - startedAt;
+
+        assert.equal(count, 1);
+        assert.equal(fs.existsSync(ourJson), false);
+        assert.equal(fs.existsSync(otherJson), true);
+        assert.ok(elapsed < 1000, `expected fast teardown, took ${elapsed}ms`);
+        assert.equal(requests.length, 1);
+      } finally {
+        fs.rmSync(`${otherJson}.lock`, { recursive: true, force: true });
+      }
+    });
+  });
+});
+
+test("teardownBrokersForSession reclaims a stale lock and still tears the broker down", async () => {
+  await withPluginData(async () => {
+    await withReadyBroker(async ({ endpoint, requests, sessionDir }) => {
+      const stateRoot = stateRootForTest();
+      const brokerJson = writeBrokerJson(stateRoot, "worktree-stalelock1234", {
+        endpoint, pidFile: null, logFile: null, sessionDir, pid: null, sessionId: "S"
+      });
+
+      // A lock left behind by a crashed holder: present but aged well past the
+      // stale threshold, so acquisition must reclaim it instead of timing out.
+      const lockDir = `${brokerJson}.lock`;
+      fs.mkdirSync(lockDir);
+      const old = new Date(Date.now() - 120000);
+      fs.utimesSync(lockDir, old, old);
+
+      const startedAt = Date.now();
+      const count = await teardownBrokersForSession("S", { killProcess: () => {}, lockTimeoutMs: 2000 });
+      const elapsed = Date.now() - startedAt;
+
+      assert.equal(count, 1);
+      assert.equal(fs.existsSync(brokerJson), false);
+      assert.equal(requests.length, 1);
+      assert.ok(elapsed < 1000, `stale lock should be reclaimed promptly, took ${elapsed}ms`);
+    });
+  });
+});
+
+test("teardownBrokersForSession stops scanning once its time budget is exhausted", async () => {
+  await withPluginData(async () => {
+    const stateRoot = stateRootForTest();
+    // Two same-session entries, both with held locks. With a tiny budget the
+    // scan must return promptly rather than spending lockTimeoutMs on each.
+    const a = writeBrokerJson(stateRoot, "worktree-budgetaaaaaaaa", {
+      endpoint: "unix:/tmp/codex-test-b1.sock",
+      pidFile: null, logFile: null, sessionDir: null, pid: null, sessionId: "S"
+    });
+    const b = writeBrokerJson(stateRoot, "worktree-budgetbbbbbbbb", {
+      endpoint: "unix:/tmp/codex-test-b2.sock",
+      pidFile: null, logFile: null, sessionDir: null, pid: null, sessionId: "S"
+    });
+    fs.mkdirSync(`${a}.lock`);
+    fs.mkdirSync(`${b}.lock`);
+
+    try {
+      const startedAt = Date.now();
+      await teardownBrokersForSession("S", { killProcess: () => {}, lockTimeoutMs: 5000, budgetMs: 200 });
+      const elapsed = Date.now() - startedAt;
+      assert.ok(elapsed < 1500, `expected budget-bounded scan, took ${elapsed}ms`);
+    } finally {
+      fs.rmSync(`${a}.lock`, { recursive: true, force: true });
+      fs.rmSync(`${b}.lock`, { recursive: true, force: true });
+    }
   });
 });
 
@@ -589,6 +680,63 @@ test("ensureBrokerSession reuses a live replacement broker after losing the lock
         assert.deepEqual(session.sessionIds, ["C", "B"]);
         assert.deepEqual(loadBrokerSession(cwd).sessionIds, ["C", "B"]);
       });
+    });
+  });
+});
+
+test("handleSessionEnd falls through to cwd teardown when session teardown is skipped under lock contention", async () => {
+  await withPluginData(async () => {
+    await withReadyBroker(async ({ endpoint, requests, sessionDir }) => {
+      const cwd = makeTempDir();
+      saveBrokerSession(cwd, {
+        endpoint, pidFile: null, logFile: null, sessionDir, pid: null,
+        sessionId: "S", sessionIds: ["S"]
+      });
+      // Hold the broker's lock so the session-keyed teardown skips it; the
+      // record then still lists the ending session as its only owner.
+      const lockDir = `${path.join(resolveStateDir(cwd), "broker.json")}.lock`;
+      fs.mkdirSync(lockDir);
+
+      try {
+        await handleSessionEnd({ cwd, session_id: "S" });
+        // The cwd fallback (which does not take the lock) must still tear it
+        // down rather than leaving a broker owned only by the ended session.
+        assert.equal(loadBrokerSession(cwd), null);
+        assert.equal(requests.length, 1);
+      } finally {
+        fs.rmSync(lockDir, { recursive: true, force: true });
+      }
+    });
+  });
+});
+
+test("teardownBrokersForSession caps shutdown waits to the remaining budget", async () => {
+  await withPluginData(async () => {
+    await withHangingBroker(async ({ endpoint, sessionDir, destroySockets }) => {
+      const stateRoot = stateRootForTest();
+      writeBrokerJson(stateRoot, "worktree-hang1aaaaaaaaa", {
+        endpoint, pidFile: null, logFile: null, sessionDir, pid: null,
+        sessionId: "S", sessionIds: ["S"]
+      });
+      writeBrokerJson(stateRoot, "worktree-hang2bbbbbbbbb", {
+        endpoint, pidFile: null, logFile: null, sessionDir: null, pid: null,
+        sessionId: "S", sessionIds: ["S"]
+      });
+
+      try {
+        const startedAt = Date.now();
+        // Endpoints accept but never reply; a per-RPC 1s wait on each would blow
+        // the budget. The scan must honor budgetMs across shutdown waits.
+        await teardownBrokersForSession("S", {
+          killProcess: () => {},
+          shutdownTimeoutMs: 1000,
+          budgetMs: 300
+        });
+        const elapsed = Date.now() - startedAt;
+        assert.ok(elapsed < 900, `expected budget-capped shutdown, took ${elapsed}ms`);
+      } finally {
+        destroySockets();
+      }
     });
   });
 });
