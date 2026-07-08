@@ -183,7 +183,6 @@ export async function sendBrokerShutdown(endpoint, { timeoutMs = BROKER_SHUTDOWN
   await new Promise((resolve) => {
     let settled = false;
     let timer = null;
-    const socket = connectToEndpoint(endpoint);
     const finish = () => {
       if (settled) {
         return;
@@ -194,6 +193,16 @@ export async function sendBrokerShutdown(endpoint, { timeoutMs = BROKER_SHUTDOWN
       }
       resolve();
     };
+    // Graceful shutdown is best-effort: a corrupt/unsupported endpoint makes
+    // connectToEndpoint (parseBrokerEndpoint) throw synchronously. Never reject,
+    // so callers always fall through to the forced process/file teardown.
+    let socket;
+    try {
+      socket = connectToEndpoint(endpoint);
+    } catch {
+      finish();
+      return;
+    }
     if (timeoutMs > 0) {
       timer = setTimeout(() => {
         socket.destroy();
@@ -243,10 +252,19 @@ export function loadBrokerSession(cwd) {
   }
 }
 
+// Write broker.json atomically (temp + rename) so a concurrent reader — e.g. an
+// unlocked ownership pre-check in another session's teardown — never observes a
+// half-written file and mis-parses it.
+function writeBrokerStateFile(stateFile, session) {
+  const tmp = `${stateFile}.tmp-${process.pid}-${(brokerLockTokenSeq += 1)}`;
+  fs.writeFileSync(tmp, `${JSON.stringify(session, null, 2)}\n`, "utf8");
+  fs.renameSync(tmp, stateFile);
+}
+
 export function saveBrokerSession(cwd, session) {
   const stateDir = resolveStateDir(cwd);
   fs.mkdirSync(stateDir, { recursive: true });
-  fs.writeFileSync(resolveBrokerStateFile(cwd), `${JSON.stringify(session, null, 2)}\n`, "utf8");
+  writeBrokerStateFile(resolveBrokerStateFile(cwd), session);
 }
 
 export function clearBrokerSession(cwd) {
@@ -445,14 +463,17 @@ export async function teardownBrokersForSession(
     // Ownership pre-check without the lock: never block on a lock held for a
     // workspace this session does not own. The owner set only ever grows to
     // include our sessionId (reuse) or shrinks when we ourselves remove it, so
-    // an unlocked read cannot falsely exclude a broker we own.
-    let preview;
+    // an unlocked read cannot falsely exclude a broker we own. A parse failure
+    // (e.g. a genuinely corrupt file) is NOT treated as "not ours" — fall
+    // through to the locked re-read, which is authoritative, rather than
+    // skipping a broker that might belong to this session.
+    let preview = null;
     try {
       preview = JSON.parse(fs.readFileSync(stateFile, "utf8"));
     } catch {
-      continue;
+      preview = null;
     }
-    if (!brokerSessionOwners(preview).includes(sessionId)) {
+    if (preview && !brokerSessionOwners(preview).includes(sessionId)) {
       continue;
     }
 
@@ -482,11 +503,11 @@ export async function teardownBrokersForSession(
           }
           const remainingOwners = owners.filter((owner) => owner !== sessionId);
           if (remainingOwners.length > 0) {
-            fs.writeFileSync(
-              stateFile,
-              `${JSON.stringify({ ...session, sessionId: remainingOwners[0], sessionIds: remainingOwners }, null, 2)}\n`,
-              "utf8"
-            );
+            writeBrokerStateFile(stateFile, {
+              ...session,
+              sessionId: remainingOwners[0],
+              sessionIds: remainingOwners
+            });
             return;
           }
 

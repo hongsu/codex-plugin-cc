@@ -684,6 +684,74 @@ test("ensureBrokerSession reuses a live replacement broker after losing the lock
   });
 });
 
+test("teardownBrokersForSession tolerates an unparseable broker.json and keeps cleaning later brokers", async () => {
+  await withPluginData(async () => {
+    await withReadyBroker(async ({ endpoint, requests, sessionDir }) => {
+      const stateRoot = stateRootForTest();
+
+      // A corrupt/half-written broker.json: the unlocked ownership pre-check
+      // must not treat a parse failure as "not ours" and abort or skip the
+      // rest of the scan.
+      const corruptDir = path.join(stateRoot, "worktree-badjson00000");
+      fs.mkdirSync(corruptDir, { recursive: true });
+      fs.writeFileSync(path.join(corruptDir, "broker.json"), "{ not valid json", "utf8");
+
+      const goodJson = writeBrokerJson(stateRoot, "worktree-goodjson11111", {
+        endpoint, pidFile: null, logFile: null, sessionDir, pid: null, sessionId: "S"
+      });
+
+      const count = await teardownBrokersForSession("S", { killProcess: () => {}, lockTimeoutMs: 200 });
+
+      assert.equal(count, 1);
+      assert.equal(fs.existsSync(goodJson), false);
+      assert.equal(requests.length, 1);
+    });
+  });
+});
+
+test("saveBrokerSession writes broker.json atomically", async () => {
+  await withPluginData(async () => {
+    const cwd = makeTempDir();
+    saveBrokerSession(cwd, { endpoint: "unix:/tmp/x.sock", sessionId: "S", sessionIds: ["S"] });
+    const dir = resolveStateDir(cwd);
+    // No leftover temp files, and the persisted file parses cleanly.
+    const leftovers = fs.readdirSync(dir).filter((name) => name.includes("broker.json.tmp"));
+    assert.deepEqual(leftovers, []);
+    assert.equal(loadBrokerSession(cwd).sessionId, "S");
+  });
+});
+
+test("teardownBrokersForSession tolerates a corrupt endpoint and keeps cleaning later brokers", async () => {
+  await withPluginData(async () => {
+    await withReadyBroker(async ({ endpoint, requests, sessionDir }) => {
+      const stateRoot = stateRootForTest();
+
+      // A stale record with an unsupported endpoint: sendBrokerShutdown would
+      // throw synchronously on it. It must be torn down best-effort, not abort
+      // the scan.
+      const corruptPid = 999999999; // non-existent; killProcess is mocked below
+      const corruptJson = writeBrokerJson(stateRoot, "worktree-corrupt00000", {
+        endpoint: "garbage-endpoint", pidFile: null, logFile: null,
+        sessionDir: null, pid: corruptPid, sessionId: "S"
+      });
+
+      // A healthy broker owned by the same session, later in the scan.
+      const goodJson = writeBrokerJson(stateRoot, "worktree-goodendpoint1", {
+        endpoint, pidFile: null, logFile: null, sessionDir, pid: null, sessionId: "S"
+      });
+
+      const killed = [];
+      const count = await teardownBrokersForSession("S", { killProcess: (pid) => killed.push(pid) });
+
+      assert.equal(count, 2);
+      assert.equal(fs.existsSync(corruptJson), false);
+      assert.equal(fs.existsSync(goodJson), false);
+      assert.ok(killed.includes(corruptPid));
+      assert.equal(requests.length, 1);
+    });
+  });
+});
+
 test("handleSessionEnd falls through to cwd teardown when session teardown is skipped under lock contention", async () => {
   await withPluginData(async () => {
     await withReadyBroker(async ({ endpoint, requests, sessionDir }) => {
