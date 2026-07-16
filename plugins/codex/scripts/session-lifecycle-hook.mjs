@@ -17,18 +17,19 @@ import {
   teardownBrokerSession,
   teardownBrokersForSession
 } from "./lib/broker-lifecycle.mjs";
-import { loadState, resolveStateFile, saveState } from "./lib/state.mjs";
+import { loadState, resolveStateFile, resolveStateRoot, saveState } from "./lib/state.mjs";
 import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
 const PLUGIN_DATA_ENV = "CLAUDE_PLUGIN_DATA";
-// hooks.json gives the SessionEnd hook a 5s budget. Keep the session-keyed
-// broker scan well under it — a short per-entry lock wait plus a total scan
-// deadline — so a single contended broker.json.lock cannot starve the rest of
-// cleanup before the hook is killed.
-const SESSION_END_TEARDOWN_BUDGET_MS = 3000;
+// hooks.json gives the SessionEnd hook a 5s budget. Share a shorter deadline
+// across cross-workspace job discovery/cleanup and session-keyed broker
+// teardown so the cwd fallback retains time before the hook is killed.
+const SESSION_END_CLEANUP_BUDGET_MS = 3000;
 const SESSION_END_LOCK_TIMEOUT_MS = 750;
+const MAX_SESSION_JOB_STATE_FILES = 1000;
+const MAX_SESSION_JOB_STATE_BYTES = 1024 * 1024;
 
 function readHookInput() {
   const raw = fs.readFileSync(0, "utf8").trim();
@@ -49,12 +50,7 @@ function appendEnvVar(name, value) {
   fs.appendFileSync(process.env.CLAUDE_ENV_FILE, `export ${name}=${shellEscape(value)}\n`, "utf8");
 }
 
-function cleanupSessionJobs(cwd, sessionId) {
-  if (!cwd || !sessionId) {
-    return;
-  }
-
-  const workspaceRoot = resolveWorkspaceRoot(cwd);
+function cleanupWorkspaceSessionJobs(workspaceRoot, sessionId) {
   const stateFile = resolveStateFile(workspaceRoot);
   if (!fs.existsSync(stateFile)) {
     return;
@@ -84,6 +80,101 @@ function cleanupSessionJobs(cwd, sessionId) {
   });
 }
 
+function readSessionJobsFromStateFile(stateFile) {
+  let descriptor = null;
+  try {
+    const before = fs.lstatSync(stateFile);
+    if (!before.isFile() || before.size > MAX_SESSION_JOB_STATE_BYTES) {
+      return { jobs: [], complete: false };
+    }
+    const noFollow = fs.constants.O_NOFOLLOW ?? 0;
+    const nonBlock = fs.constants.O_NONBLOCK ?? 0;
+    descriptor = fs.openSync(stateFile, fs.constants.O_RDONLY | noFollow | nonBlock);
+    const opened = fs.fstatSync(descriptor);
+    if (!opened.isFile() || opened.size > MAX_SESSION_JOB_STATE_BYTES ||
+        opened.dev !== before.dev || opened.ino !== before.ino) {
+      return { jobs: [], complete: false };
+    }
+    const state = JSON.parse(fs.readFileSync(descriptor, "utf8"));
+    return { jobs: Array.isArray(state.jobs) ? state.jobs : [], complete: true };
+  } catch (error) {
+    return { jobs: [], complete: error?.code === "ENOENT" };
+  } finally {
+    if (descriptor != null) {
+      fs.closeSync(descriptor);
+    }
+  }
+}
+
+function findSessionJobWorkspaces(cwd, sessionId, deadline) {
+  const workspaceRoots = new Set([resolveWorkspaceRoot(cwd)]);
+  const stateRoot = resolveStateRoot();
+  if (!fs.existsSync(stateRoot)) {
+    return { workspaceRoots, complete: true };
+  }
+
+  const stateDirectory = fs.opendirSync(stateRoot);
+  let complete = true;
+  let exhausted = false;
+  try {
+    let scanned = 0;
+    while (scanned < MAX_SESSION_JOB_STATE_FILES && Date.now() < deadline) {
+      const entry = stateDirectory.readSync();
+      if (!entry) {
+        exhausted = true;
+        break;
+      }
+      scanned += 1;
+      if (entry.isSymbolicLink()) {
+        complete = false;
+        continue;
+      }
+      if (!entry.isDirectory()) {
+        continue;
+      }
+      const stateFile = path.join(stateRoot, entry.name, "state.json");
+      const state = readSessionJobsFromStateFile(stateFile);
+      complete &&= state.complete;
+      for (const job of state.jobs) {
+        if (job.sessionId === sessionId && typeof job.workspaceRoot === "string" && job.workspaceRoot) {
+          workspaceRoots.add(job.workspaceRoot);
+        }
+      }
+    }
+    if (!exhausted) {
+      complete = false;
+    }
+  } finally {
+    stateDirectory.closeSync();
+  }
+  return { workspaceRoots, complete };
+}
+
+function cleanupSessionJobs(cwd, sessionId, deadline) {
+  if (!cwd || !sessionId) {
+    return { discoveryComplete: true, error: null };
+  }
+
+  let cleanupError = null;
+  let workspaceIndex = 0;
+  const discovery = findSessionJobWorkspaces(cwd, sessionId, deadline);
+  for (const workspaceRoot of discovery.workspaceRoots) {
+    // Always clean the hook cwd first. Bound additional workspace cleanup by
+    // the shared SessionEnd deadline so broker cleanup and the cwd fallback
+    // retain time inside the hook's 5-second limit.
+    if (workspaceIndex > 0 && Date.now() >= deadline) {
+      break;
+    }
+    workspaceIndex += 1;
+    try {
+      cleanupWorkspaceSessionJobs(workspaceRoot, sessionId);
+    } catch (error) {
+      cleanupError ??= error;
+    }
+  }
+  return { discoveryComplete: discovery.complete, error: cleanupError };
+}
+
 function handleSessionStart(input) {
   appendEnvVar(SESSION_ID_ENV, input.session_id);
   appendEnvVar(TRANSCRIPT_PATH_ENV, input.transcript_path);
@@ -93,19 +184,28 @@ function handleSessionStart(input) {
 export async function handleSessionEnd(input) {
   const cwd = input.cwd || process.cwd();
   const sessionId = input.session_id || process.env[SESSION_ID_ENV];
+  const cleanupDeadline = Date.now() + SESSION_END_CLEANUP_BUDGET_MS;
   let cleanupError = null;
+  let jobDiscoveryComplete = true;
   try {
-    cleanupSessionJobs(cwd, sessionId);
+    const cleanup = cleanupSessionJobs(cwd, sessionId, cleanupDeadline);
+    cleanupError = cleanup.error;
+    jobDiscoveryComplete = cleanup.discoveryComplete;
   } catch (error) {
     cleanupError = error;
+    jobDiscoveryComplete = false;
   }
 
-  if (sessionId) {
-    await teardownBrokersForSession(sessionId, {
-      killProcess: terminateProcessTree,
-      lockTimeoutMs: SESSION_END_LOCK_TIMEOUT_MS,
-      budgetMs: SESSION_END_TEARDOWN_BUDGET_MS
-    });
+  if (sessionId && jobDiscoveryComplete) {
+    try {
+      await teardownBrokersForSession(sessionId, {
+        killProcess: terminateProcessTree,
+        lockTimeoutMs: SESSION_END_LOCK_TIMEOUT_MS,
+        budgetMs: Math.max(0, cleanupDeadline - Date.now())
+      });
+    } catch (error) {
+      cleanupError ??= error;
+    }
   }
 
   const brokerSession =

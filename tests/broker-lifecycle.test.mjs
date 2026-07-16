@@ -9,7 +9,15 @@ import assert from "node:assert/strict";
 
 import { makeTempDir } from "./helpers.mjs";
 import { createBrokerEndpoint, parseBrokerEndpoint } from "../plugins/codex/scripts/lib/broker-endpoint.mjs";
-import { resolveStateDir, resolveStateRoot } from "../plugins/codex/scripts/lib/state.mjs";
+import {
+  loadState,
+  resolveJobFile,
+  resolveJobLogFile,
+  resolveStateDir,
+  resolveStateRoot,
+  saveState,
+  writeJobFile
+} from "../plugins/codex/scripts/lib/state.mjs";
 import {
   ensureBrokerSession,
   loadBrokerSession,
@@ -27,6 +35,10 @@ function sleep(ms) {
 // (serve --endpoint --cwd --pid-file) enough for waitForBrokerEndpoint.
 const FAKE_BROKER_SCRIPT = `import fs from "node:fs";
 import net from "node:net";
+
+if (process.env.TEST_BROKER_SPAWN_MARKER) {
+  fs.writeFileSync(process.env.TEST_BROKER_SPAWN_MARKER, "spawned", "utf8");
+}
 
 const args = process.argv.slice(2);
 const get = (name) => args[args.indexOf(name) + 1];
@@ -330,16 +342,22 @@ test("concurrent SessionEnd hooks tear down a shared broker after the last owner
         const markerDir = process.env.TEST_MARKER_DIR;
         const sessionId = process.env.TEST_SESSION_ID;
         const otherSessionId = sessionId === "A" ? "B" : "A";
-        const originalWriteFileSync = fs.writeFileSync.bind(fs);
+        const lockDir = stateFile + ".lock";
+        const originalMkdirSync = fs.mkdirSync.bind(fs);
+        let reachedBarrier = false;
 
-        fs.writeFileSync = (file, data, ...args) => {
-          if (file === stateFile && String(data).includes('"sessionIds"')) {
-            originalWriteFileSync(path.join(markerDir, sessionId + ".ready"), "", "utf8");
+        fs.mkdirSync = (dir, ...args) => {
+          if (dir === lockDir && !reachedBarrier) {
+            reachedBarrier = true;
+            fs.writeFileSync(path.join(markerDir, sessionId + ".ready"), "", "utf8");
             const otherReady = path.join(markerDir, otherSessionId + ".ready");
-            const deadline = Date.now() + 500;
+            const deadline = Date.now() + 2000;
             while (!fs.existsSync(otherReady) && Date.now() < deadline) {}
+            if (!fs.existsSync(otherReady)) {
+              throw new Error("other SessionEnd did not reach the lock barrier");
+            }
           }
-          return originalWriteFileSync(file, data, ...args);
+          return originalMkdirSync(dir, ...args);
         };
 
         const { teardownBrokersForSession } = await import(process.env.TEST_BROKER_MODULE_URL);
@@ -399,6 +417,154 @@ test("handleSessionEnd still tears down session brokers when job cleanup fails",
 
     await assert.rejects(() => handleSessionEnd({ cwd, session_id: "S" }), { code: "EISDIR" });
     assert.equal(fs.existsSync(path.join(workspaceStateDir, "broker.json")), false);
+  });
+});
+
+test("handleSessionEnd cleans session jobs from a different --cwd workspace before broker teardown", async () => {
+  await withPluginData(async () => {
+    const hookCwd = makeTempDir();
+    const jobWorkspace = makeTempDir();
+    const jobId = "cross-cwd-job";
+    const jobLog = resolveJobLogFile(jobWorkspace, jobId);
+    const job = {
+      id: jobId,
+      status: "running",
+      sessionId: "S",
+      workspaceRoot: jobWorkspace,
+      pid: 999999999,
+      logFile: jobLog
+    };
+    fs.writeFileSync(jobLog, "running\n", "utf8");
+    writeJobFile(jobWorkspace, jobId, job);
+    saveState(jobWorkspace, { jobs: [job] });
+    saveBrokerSession(jobWorkspace, {
+      endpoint: "unix:/tmp/codex-test-cross-cwd.sock",
+      pidFile: null,
+      logFile: null,
+      sessionDir: null,
+      pid: null,
+      sessionId: "S",
+      sessionIds: ["S"]
+    });
+
+    await handleSessionEnd({ cwd: hookCwd, session_id: "S" });
+
+    assert.deepEqual(loadState(jobWorkspace).jobs, []);
+    assert.equal(fs.existsSync(resolveJobFile(jobWorkspace, jobId)), false);
+    assert.equal(fs.existsSync(jobLog), false);
+    assert.equal(loadBrokerSession(jobWorkspace), null);
+  });
+});
+
+test("handleSessionEnd continues cross-cwd cleanup after one workspace cleanup fails", async () => {
+  await withPluginData(async () => {
+    const hookCwd = makeTempDir();
+    const otherWorkspace = makeTempDir();
+    const badLog = path.join(resolveStateDir(hookCwd), "bad.log");
+    fs.mkdirSync(badLog, { recursive: true });
+    saveState(hookCwd, {
+      jobs: [{
+        id: "bad-job",
+        status: "completed",
+        sessionId: "S",
+        workspaceRoot: hookCwd,
+        logFile: badLog
+      }]
+    });
+
+    const otherJobId = "other-job";
+    const otherLog = resolveJobLogFile(otherWorkspace, otherJobId);
+    const otherJob = {
+      id: otherJobId,
+      status: "running",
+      sessionId: "S",
+      workspaceRoot: otherWorkspace,
+      pid: 999999999,
+      logFile: otherLog
+    };
+    fs.writeFileSync(otherLog, "running\n", "utf8");
+    writeJobFile(otherWorkspace, otherJobId, otherJob);
+    saveState(otherWorkspace, { jobs: [otherJob] });
+    saveBrokerSession(otherWorkspace, {
+      endpoint: "unix:/tmp/codex-test-other-workspace.sock",
+      sessionId: "S",
+      sessionIds: ["S"]
+    });
+
+    await assert.rejects(() => handleSessionEnd({ cwd: hookCwd, session_id: "S" }), { code: "EISDIR" });
+
+    assert.deepEqual(loadState(otherWorkspace).jobs, []);
+    assert.equal(fs.existsSync(resolveJobFile(otherWorkspace, otherJobId)), false);
+    assert.equal(fs.existsSync(otherLog), false);
+    assert.equal(loadBrokerSession(otherWorkspace), null);
+  });
+});
+
+test("handleSessionEnd preserves cross-cwd brokers when job-state discovery is incomplete", async () => {
+  await withPluginData(async () => {
+    const hookCwd = makeTempDir();
+    const jobWorkspace = makeTempDir();
+    const stateDir = resolveStateDir(jobWorkspace);
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(stateDir, "state.json"),
+      JSON.stringify({
+        jobs: [{
+          id: "oversized-job",
+          status: "running",
+          sessionId: "S",
+          workspaceRoot: jobWorkspace,
+          padding: "x".repeat(1024 * 1024)
+        }]
+      }),
+      "utf8"
+    );
+    saveBrokerSession(jobWorkspace, {
+      endpoint: "unix:/tmp/codex-test-oversized-state.sock",
+      sessionId: "S",
+      sessionIds: ["S"]
+    });
+
+    await handleSessionEnd({ cwd: hookCwd, session_id: "S" });
+
+    assert.equal(loadState(jobWorkspace).jobs.length, 1);
+    assert.notEqual(loadBrokerSession(jobWorkspace), null);
+  });
+});
+
+test("handleSessionEnd gives broker teardown only the remaining shared cleanup budget", async () => {
+  await withPluginData(async () => {
+    const hookCwd = makeTempDir();
+    const brokerWorkspace = makeTempDir();
+    saveBrokerSession(brokerWorkspace, {
+      endpoint: "unix:/tmp/codex-test-shared-deadline.sock",
+      sessionId: "S",
+      sessionIds: ["S"]
+    });
+
+    const probe = fs.opendirSync(stateRootForTest());
+    const dirPrototype = Object.getPrototypeOf(probe);
+    probe.closeSync();
+    const originalReadSync = dirPrototype.readSync;
+    const originalNow = Date.now;
+    let now = 0;
+    Date.now = () => now;
+    dirPrototype.readSync = function (...args) {
+      const entry = originalReadSync.call(this, ...args);
+      if (!entry) {
+        now = 3000;
+      }
+      return entry;
+    };
+
+    try {
+      await handleSessionEnd({ cwd: hookCwd, session_id: "S" });
+    } finally {
+      Date.now = originalNow;
+      dirPrototype.readSync = originalReadSync;
+    }
+
+    assert.notEqual(loadBrokerSession(brokerWorkspace), null);
   });
 });
 
@@ -463,6 +629,57 @@ test("teardownBrokersForSession skips a same-session locked entry but tears down
         fs.rmSync(`${lockedJson}.lock`, { recursive: true, force: true });
       }
     });
+  });
+});
+
+test("teardownBrokersForSession replaces an invalid non-directory lock path", async () => {
+  await withPluginData(async () => {
+    const stateRoot = stateRootForTest();
+    const brokerJson = writeBrokerJson(stateRoot, "worktree-invalidlockaaa", {
+      endpoint: "unix:/tmp/codex-test-invalid-lock.sock",
+      sessionId: "S"
+    });
+    const lockPath = `${brokerJson}.lock`;
+    fs.writeFileSync(lockPath, "not a directory", "utf8");
+
+    const count = await teardownBrokersForSession("S", { killProcess: () => {}, lockTimeoutMs: 60 });
+
+    assert.equal(count, 1);
+    assert.equal(fs.existsSync(brokerJson), false);
+    assert.equal(fs.existsSync(lockPath), false);
+  });
+});
+
+test("teardownBrokersForSession never deletes a valid lock that replaces an invalid path", async () => {
+  await withPluginData(async () => {
+    const stateRoot = stateRootForTest();
+    const brokerJson = writeBrokerJson(stateRoot, "worktree-lockswapaaaa", {
+      endpoint: "unix:/tmp/codex-test-lock-swap.sock",
+      sessionId: "S"
+    });
+    const lockPath = `${brokerJson}.lock`;
+    fs.writeFileSync(lockPath, "invalid", "utf8");
+    const originalLstatSync = fs.lstatSync.bind(fs);
+    let swapped = false;
+    fs.lstatSync = (file, ...args) => {
+      const stat = originalLstatSync(file, ...args);
+      if (file === lockPath && !swapped) {
+        swapped = true;
+        fs.unlinkSync(lockPath);
+        fs.mkdirSync(lockPath);
+      }
+      return stat;
+    };
+
+    try {
+      const count = await teardownBrokersForSession("S", { killProcess: () => {}, lockTimeoutMs: 60 });
+      assert.equal(count, 0);
+    } finally {
+      fs.lstatSync = originalLstatSync;
+      fs.rmSync(lockPath, { recursive: true, force: true });
+    }
+
+    assert.equal(fs.existsSync(brokerJson), true);
   });
 });
 
@@ -596,6 +813,31 @@ test("ensureBrokerSession spawns and persists a fresh broker when the recorded o
   });
 });
 
+test("ensureBrokerSession never spawns without the state lock after acquisition times out", async () => {
+  await withPluginData(async () => {
+    const cwd = makeTempDir();
+    const spawnMarker = path.join(makeTempDir(), "spawned");
+    const stateFile = path.join(resolveStateDir(cwd), "broker.json");
+    fs.mkdirSync(path.dirname(stateFile), { recursive: true });
+    fs.mkdirSync(`${stateFile}.lock`);
+
+    try {
+      await assert.rejects(
+        () => ensureBrokerSession(cwd, {
+          scriptPath: writeFakeBrokerScript(),
+          lockTimeoutMs: 60,
+          env: { ...process.env, TEST_BROKER_SPAWN_MARKER: spawnMarker }
+        }),
+        { code: "EBROKERSTATELOCKTIMEOUT" }
+      );
+      assert.equal(loadBrokerSession(cwd), null);
+      assert.equal(fs.existsSync(spawnMarker), false);
+    } finally {
+      fs.rmSync(`${stateFile}.lock`, { recursive: true, force: true });
+    }
+  });
+});
+
 test("ensureBrokerSession does not resurrect a broker torn down while waiting for the state lock", async () => {
   await withPluginData(async () => {
     await withReadyBroker(async ({ endpoint, sessionDir }) => {
@@ -712,9 +954,33 @@ test("teardownBrokersForSession tolerates an unparseable broker.json and keeps c
 test("saveBrokerSession writes broker.json atomically", async () => {
   await withPluginData(async () => {
     const cwd = makeTempDir();
-    saveBrokerSession(cwd, { endpoint: "unix:/tmp/x.sock", sessionId: "S", sessionIds: ["S"] });
     const dir = resolveStateDir(cwd);
-    // No leftover temp files, and the persisted file parses cleanly.
+    const stateFile = path.join(dir, "broker.json");
+    const operations = [];
+    const originalWriteFileSync = fs.writeFileSync.bind(fs);
+    const originalRenameSync = fs.renameSync.bind(fs);
+    fs.writeFileSync = (file, data, ...args) => {
+      if (String(file).startsWith(`${stateFile}.tmp-`) || file === stateFile) {
+        operations.push(["write", String(file)]);
+      }
+      return originalWriteFileSync(file, data, ...args);
+    };
+    fs.renameSync = (from, to) => {
+      if (to === stateFile) {
+        operations.push(["rename", String(from), String(to)]);
+      }
+      return originalRenameSync(from, to);
+    };
+    try {
+      saveBrokerSession(cwd, { endpoint: "unix:/tmp/x.sock", sessionId: "S", sessionIds: ["S"] });
+    } finally {
+      fs.writeFileSync = originalWriteFileSync;
+      fs.renameSync = originalRenameSync;
+    }
+
+    assert.equal(operations[0][0], "write");
+    assert.match(operations[0][1], /broker\.json\.tmp-/);
+    assert.deepEqual(operations[1], ["rename", operations[0][1], stateFile]);
     const leftovers = fs.readdirSync(dir).filter((name) => name.includes("broker.json.tmp"));
     assert.deepEqual(leftovers, []);
     assert.equal(loadBrokerSession(cwd).sessionId, "S");
@@ -749,6 +1015,39 @@ test("teardownBrokersForSession tolerates a corrupt endpoint and keeps cleaning 
       assert.ok(killed.includes(corruptPid));
       assert.equal(requests.length, 1);
     });
+  });
+});
+
+test("teardownBrokersForSession continues after one broker cleanup fails", async () => {
+  await withPluginData(async () => {
+    const stateRoot = stateRootForTest();
+    const firstJson = writeBrokerJson(stateRoot, "worktree-0000failureaaa", {
+      endpoint: "unix:/tmp/codex-test-cleanup-failure.sock",
+      sessionId: "S"
+    });
+    const secondJson = writeBrokerJson(stateRoot, "worktree-9999successbbb", {
+      endpoint: "unix:/tmp/codex-test-cleanup-success.sock",
+      sessionId: "S"
+    });
+    const originalUnlinkSync = fs.unlinkSync.bind(fs);
+    fs.unlinkSync = (file) => {
+      if (file === firstJson) {
+        throw Object.assign(new Error("simulated unlink failure"), { code: "EACCES" });
+      }
+      return originalUnlinkSync(file);
+    };
+
+    try {
+      await assert.rejects(
+        () => teardownBrokersForSession("S", { killProcess: () => {} }),
+        { code: "EACCES" }
+      );
+    } finally {
+      fs.unlinkSync = originalUnlinkSync;
+    }
+
+    assert.equal(fs.existsSync(firstJson), true);
+    assert.equal(fs.existsSync(secondJson), false);
   });
 });
 

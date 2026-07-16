@@ -85,39 +85,56 @@ async function withBrokerStateFileLock(stateFile, fn, options = {}) {
       if (error?.code !== "EEXIST") {
         throw error;
       }
+      let stat = null;
       try {
-        const stat = fs.statSync(lockDir);
-        if (Date.now() - stat.mtimeMs > staleMs) {
-          // Reclaim atomically: rename the stale directory to a private name so
-          // only one reclaimer can take it — a blind rmSync lets two reclaimers
-          // each delete the other's freshly created lock. After the rename,
-          // re-check the mtime: if the directory we grabbed was refreshed after
-          // our stat (a fresh lock, not the stale one), put it back untouched.
-          const claimed = `${lockDir}.reclaim-${process.pid}-${(brokerLockTokenSeq += 1)}`;
-          try {
-            fs.renameSync(lockDir, claimed);
-            if (Date.now() - fs.statSync(claimed).mtimeMs > staleMs) {
+        stat = fs.lstatSync(lockDir);
+      } catch {
+        // The lock may have disappeared between mkdirSync and lstatSync. Retry
+        // through the normal deadline/backoff path instead of spinning.
+      }
+      if (stat && !stat.isDirectory()) {
+        try {
+          // unlinkSync cannot remove a directory. If another contender replaced
+          // the invalid path with a real lock after lstatSync, this fails safely
+          // instead of renaming or deleting that contender's lock.
+          fs.unlinkSync(lockDir);
+        } catch {
+          // Lost the replacement race or cannot remove the invalid path. Retry
+          // through the normal deadline/backoff path below.
+        }
+      }
+      if (stat && Date.now() - stat.mtimeMs > staleMs) {
+        // Reclaim atomically: rename the stale directory to a private name so
+        // only one reclaimer can take it — a blind rmSync lets two reclaimers
+        // each delete the other's freshly created lock. After the rename,
+        // re-check the mtime: if the directory we grabbed was refreshed after
+        // our stat (a fresh lock, not the stale one), put it back untouched.
+        const claimed = `${lockDir}.reclaim-${process.pid}-${(brokerLockTokenSeq += 1)}`;
+        let reclaimed = false;
+        try {
+          fs.renameSync(lockDir, claimed);
+          if (Date.now() - fs.statSync(claimed).mtimeMs > staleMs) {
+            fs.rmSync(claimed, { recursive: true, force: true });
+            reclaimed = true;
+          } else {
+            try {
+              fs.renameSync(claimed, lockDir);
+            } catch {
+              // A new lock already took the path; drop the moved copy.
               fs.rmSync(claimed, { recursive: true, force: true });
-            } else {
-              try {
-                fs.renameSync(claimed, lockDir);
-              } catch {
-                // A new lock already took the path; drop the moved copy.
-                fs.rmSync(claimed, { recursive: true, force: true });
-              }
             }
-          } catch {
-            // Lost the reclaim race; fall through and retry acquisition.
           }
+        } catch {
+          // Lost the reclaim race; fall through and retry acquisition.
+        }
+        if (reclaimed) {
           continue;
         }
-      } catch {
-        continue;
       }
       if (Date.now() >= deadline) {
-        const timeout = new Error(`Timed out waiting for broker state lock: ${stateFile}`);
-        timeout.code = BROKER_LOCK_TIMEOUT_CODE;
-        throw timeout;
+        throw Object.assign(new Error(`Timed out waiting for broker state lock: ${stateFile}`), {
+          code: BROKER_LOCK_TIMEOUT_CODE
+        });
       }
       await sleep(25);
     }
@@ -372,6 +389,7 @@ async function adoptOrSpawnBroker(cwd, options) {
 
 export async function ensureBrokerSession(cwd, options = {}) {
   const stateFile = resolveBrokerStateFile(cwd);
+  const lockOptions = options.lockTimeoutMs == null ? {} : { timeoutMs: options.lockTimeoutMs };
 
   // Fast path: reuse a ready broker. The readiness probe runs outside the lock,
   // so the broker may have been torn down (or replaced) before we acquired it;
@@ -381,7 +399,6 @@ export async function ensureBrokerSession(cwd, options = {}) {
     if (!existing || !(await isBrokerEndpointReady(existing.endpoint))) {
       break;
     }
-    let lockUnavailable = false;
     const reused = await withBrokerStateFileLock(stateFile, () => {
       const current = loadBrokerSession(cwd);
       if (!current || current.endpoint !== existing.endpoint) {
@@ -392,18 +409,9 @@ export async function ensureBrokerSession(cwd, options = {}) {
         saveBrokerSession(cwd, withOwner);
       }
       return withOwner;
-    }).catch((error) => {
-      if (isBrokerLockTimeout(error)) {
-        lockUnavailable = true;
-        return null;
-      }
-      throw error;
-    });
+    }, lockOptions);
     if (reused) {
       return reused;
-    }
-    if (lockUnavailable) {
-      break;
     }
     // State changed while we waited for the lock — re-probe: a replacement
     // broker may already be live and reusable.
@@ -412,24 +420,7 @@ export async function ensureBrokerSession(cwd, options = {}) {
   // Slow path: adopt-or-spawn under the lock so concurrent spawns don't orphan
   // brokers. resolveStateDir must exist before we can create the lock dir.
   fs.mkdirSync(resolveStateDir(cwd), { recursive: true });
-  let lockUnavailable = false;
-  const created = await withBrokerStateFileLock(stateFile, () => adoptOrSpawnBroker(cwd, options)).catch((error) => {
-    if (isBrokerLockTimeout(error)) {
-      lockUnavailable = true;
-      return null;
-    }
-    throw error;
-  });
-  if (!lockUnavailable) {
-    return created;
-  }
-
-  // Lock stayed busy past the timeout: proceed without it rather than block
-  // starting Codex. adopt-or-spawn still reuses a live recorded broker (and
-  // only discards one that fails its readiness probe), so a long-held lock
-  // never causes another session's live broker to be unlinked/orphaned. Rare,
-  // and degrades only to the pre-lock race window.
-  return adoptOrSpawnBroker(cwd, options);
+  return withBrokerStateFileLock(stateFile, () => adoptOrSpawnBroker(cwd, options), lockOptions);
 }
 
 export async function teardownBrokersForSession(
@@ -451,6 +442,7 @@ export async function teardownBrokersForSession(
 
   const deadline = budgetMs != null ? Date.now() + budgetMs : null;
   let count = 0;
+  let teardownError = null;
   for (const entry of fs.readdirSync(stateRoot)) {
     if (deadline != null && Date.now() >= deadline) {
       break;
@@ -540,12 +532,16 @@ export async function teardownBrokersForSession(
       );
     } catch (error) {
       if (!isBrokerLockTimeout(error)) {
-        throw error;
+        teardownError ??= error;
+        continue;
       }
-      // Another hook holds this entry's lock and did not release it within the
-      // timeout. Skip it so the rest of this session's brokers still get torn
-      // down instead of aborting the whole scan.
+      // This entry's lock remained unavailable within the timeout. Skip it so
+      // the rest of this session's brokers still get torn down instead of
+      // aborting the whole scan.
     }
+  }
+  if (teardownError) {
+    throw teardownError;
   }
   return count;
 }
