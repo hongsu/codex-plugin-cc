@@ -434,18 +434,32 @@ test("handleSessionEnd still tears down session brokers when job cleanup fails",
     });
     const badLogFile = path.join(workspaceStateDir, "bad.log");
     fs.mkdirSync(badLogFile);
+    const originalKill = process.kill;
+    const killedPids = [];
+    process.kill = (pid, signal) => {
+      assert.deepEqual(loadState(cwd).jobs.map((job) => job.id), ["running"]);
+      assert.equal(fs.existsSync(badLogFile), true);
+      killedPids.push({ pid, signal });
+      return true;
+    };
     const stateFile = path.join(workspaceStateDir, "state.json");
     fs.writeFileSync(
       stateFile,
       `${JSON.stringify({
         version: 1,
         config: { stopReviewGate: false },
-        jobs: [{ id: "completed", status: "completed", sessionId: "S", logFile: badLogFile }]
+        jobs: [{ id: "running", status: "running", sessionId: "S", pid: 12345, logFile: badLogFile }]
       }, null, 2)}\n`,
       "utf8"
     );
 
-    await assert.rejects(() => handleSessionEnd({ cwd, session_id: "S" }), { code: "EISDIR" });
+    try {
+      await assert.rejects(() => handleSessionEnd({ cwd, session_id: "S" }), { code: "EISDIR" });
+    } finally {
+      process.kill = originalKill;
+    }
+    assert.deepEqual(killedPids, [{ pid: -12345, signal: "SIGTERM" }]);
+    assert.deepEqual(loadState(cwd).jobs.map((job) => job.id), ["running"]);
     assert.equal(fs.existsSync(path.join(workspaceStateDir, "broker.json")), false);
   });
 });

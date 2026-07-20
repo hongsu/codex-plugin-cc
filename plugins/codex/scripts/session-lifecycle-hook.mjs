@@ -52,24 +52,26 @@ function cleanupWorkspaceSessionJobs(workspaceRoot, sessionId, deadline) {
     return;
   }
 
-  const removedJobs = removeSessionJobs(workspaceRoot, sessionId, {
-    timeoutMs: Math.max(0, deadline - Date.now())
-  });
-  if (removedJobs.length === 0) {
-    return;
-  }
-
-  for (const job of removedJobs) {
-    const stillRunning = job.status === "queued" || job.status === "running";
-    if (!stillRunning) {
-      continue;
+  removeSessionJobs(
+    workspaceRoot,
+    sessionId,
+    {
+      timeoutMs: Math.max(0, deadline - Date.now()),
+      beforeRemove(jobs) {
+        for (const job of jobs) {
+          const stillRunning = job.status === "queued" || job.status === "running";
+          if (!stillRunning) {
+            continue;
+          }
+          try {
+            terminateProcessTree(job.pid ?? Number.NaN);
+          } catch {
+            // Ignore teardown failures during session shutdown.
+          }
+        }
+      }
     }
-    try {
-      terminateProcessTree(job.pid ?? Number.NaN);
-    } catch {
-      // Ignore teardown failures during session shutdown.
-    }
-  }
+  );
 }
 
 function readSessionJobsFromStateFile(stateFile) {

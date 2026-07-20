@@ -372,18 +372,20 @@ export function updateState(cwd, mutate) {
 }
 
 export function removeSessionJobs(cwd, sessionId, options = {}) {
+  const { beforeRemove = () => {}, ...lockOptions } = options;
   return withStateFileLock(cwd, () => {
     const state = loadState(cwd);
     const removedJobs = state.jobs.filter((job) => job.sessionId === sessionId);
     if (removedJobs.length === 0) {
       return [];
     }
+    beforeRemove(removedJobs);
     saveStateUnlocked(cwd, {
       ...state,
       jobs: state.jobs.filter((job) => job.sessionId !== sessionId)
     });
     return removedJobs;
-  }, options);
+  }, lockOptions);
 }
 
 export function generateJobId(prefix = "job") {
