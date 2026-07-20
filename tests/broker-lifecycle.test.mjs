@@ -23,12 +23,42 @@ import {
   loadBrokerSession,
   resolveSessionId,
   saveBrokerSession,
+  sendBrokerShutdown,
+  teardownBrokerForCwd,
   teardownBrokersForSession
 } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import { handleSessionEnd } from "../plugins/codex/scripts/session-lifecycle-hook.mjs";
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function observeLockAttempt(lockDir) {
+  const originalMkdirSync = fs.mkdirSync;
+  const originalExistsSync = fs.existsSync;
+  let notify;
+  const attempted = new Promise((resolve) => {
+    notify = resolve;
+  });
+  fs.mkdirSync = (dir, ...args) => {
+    if (dir === lockDir) {
+      notify();
+    }
+    return originalMkdirSync.call(fs, dir, ...args);
+  };
+  fs.existsSync = (target) => {
+    if (target === lockDir) {
+      notify();
+    }
+    return originalExistsSync.call(fs, target);
+  };
+  return {
+    attempted,
+    restore() {
+      fs.mkdirSync = originalMkdirSync;
+      fs.existsSync = originalExistsSync;
+    }
+  };
 }
 
 // Minimal stand-in for app-server-broker.mjs: honors the spawn contract
@@ -42,7 +72,7 @@ if (process.env.TEST_BROKER_SPAWN_MARKER) {
 
 const args = process.argv.slice(2);
 const get = (name) => args[args.indexOf(name) + 1];
-const sockPath = get("--endpoint").replace(/^unix:/, "");
+const sockPath = get("--endpoint").replace(/^(?:unix|pipe):/, "");
 const server = net.createServer((socket) => socket.end());
 server.listen(sockPath, () => {
   fs.writeFileSync(get("--pid-file"), String(process.pid), "utf8");
@@ -607,15 +637,18 @@ test("teardownBrokersForSession skips a same-session locked entry but tears down
 
       // Entry 1: owned by this session but its lock is held by a concurrent hook
       // that never released it.
-      const lockedJson = writeBrokerJson(stateRoot, "worktree-lockedaaaaaaaa", {
-        endpoint: "unix:/tmp/codex-test-locked.sock",
-        pidFile: null, logFile: null, sessionDir: null, pid: null, sessionId: "S"
+      const lockedCwd = makeTempDir();
+      saveBrokerSession(lockedCwd, {
+        endpoint, pidFile: null, logFile: null, sessionDir, pid: null,
+        sessionId: "S", sessionIds: ["S"]
       });
+      const lockedJson = path.join(resolveStateDir(lockedCwd), "broker.json");
       fs.mkdirSync(`${lockedJson}.lock`);
 
-      // Entry 2: a real broker owned by the same session, later in the scan.
+      // Entry 2: another record owned by the same session, later in the scan.
       const cleanableJson = writeBrokerJson(stateRoot, "worktree-cleanablebbbb", {
-        endpoint, pidFile: null, logFile: null, sessionDir, pid: null, sessionId: "S"
+        endpoint: "invalid:endpoint", pidFile: null, logFile: null,
+        sessionDir: null, pid: null, sessionId: "S"
       });
 
       try {
@@ -624,10 +657,20 @@ test("teardownBrokersForSession skips a same-session locked entry but tears down
         assert.equal(count, 1);
         assert.equal(fs.existsSync(cleanableJson), false);
         assert.equal(fs.existsSync(lockedJson), true);
-        assert.equal(requests.length, 1);
+        assert.equal(requests.length, 0);
       } finally {
         fs.rmSync(`${lockedJson}.lock`, { recursive: true, force: true });
       }
+
+      // The timed-out entry keeps an end marker. A later reuse applies it under
+      // the lock, so B becomes the sole owner and can perform final teardown.
+      const reused = await ensureBrokerSession(lockedCwd, {
+        env: { CODEX_COMPANION_SESSION_ID: "B" }
+      });
+      assert.deepEqual(reused.sessionIds, ["B"]);
+      assert.equal(await teardownBrokersForSession("B", { killProcess: () => {} }), 1);
+      assert.equal(fs.existsSync(lockedJson), false);
+      assert.equal(requests.length, 1);
     });
   });
 });
@@ -659,6 +702,8 @@ test("teardownBrokersForSession never deletes a valid lock that replaces an inva
     });
     const lockPath = `${brokerJson}.lock`;
     fs.writeFileSync(lockPath, "invalid", "utf8");
+    const old = new Date(Date.now() - 120000);
+    fs.utimesSync(lockPath, old, old);
     const originalLstatSync = fs.lstatSync.bind(fs);
     let swapped = false;
     fs.lstatSync = (file, ...args) => {
@@ -730,6 +775,7 @@ test("teardownBrokersForSession reclaims a stale lock and still tears the broker
       // stale threshold, so acquisition must reclaim it instead of timing out.
       const lockDir = `${brokerJson}.lock`;
       fs.mkdirSync(lockDir);
+      fs.writeFileSync(path.join(lockDir, "owner"), "2147483647-crashed", "utf8");
       const old = new Date(Date.now() - 120000);
       fs.utimesSync(lockDir, old, old);
 
@@ -852,7 +898,9 @@ test("ensureBrokerSession does not resurrect a broker torn down while waiting fo
         sessionIds: ["A"]
       });
       const stateFile = path.join(resolveStateDir(cwd), "broker.json");
-      fs.mkdirSync(`${stateFile}.lock`);
+      const lockDir = `${stateFile}.lock`;
+      fs.mkdirSync(lockDir);
+      const observer = observeLockAttempt(lockDir);
 
       const pending = ensureBrokerSession(cwd, {
         env: { CODEX_COMPANION_SESSION_ID: "B" },
@@ -861,10 +909,11 @@ test("ensureBrokerSession does not resurrect a broker torn down while waiting fo
 
       // While B is parked on the lock (readiness probe already passed), A's
       // SessionEnd shuts the broker down and removes broker.json.
-      await sleep(200);
+      await observer.attempted;
+      observer.restore();
       fs.unlinkSync(stateFile);
       fs.rmSync(parseBrokerEndpoint(endpoint).path, { force: true });
-      fs.rmdirSync(`${stateFile}.lock`);
+      fs.rmdirSync(lockDir);
 
       const session = await pending;
       try {
@@ -900,12 +949,15 @@ test("ensureBrokerSession reuses a live replacement broker after losing the lock
           sessionIds: ["A"]
         });
         const stateFile = path.join(resolveStateDir(cwd), "broker.json");
-        fs.mkdirSync(`${stateFile}.lock`);
+        const lockDir = `${stateFile}.lock`;
+        fs.mkdirSync(lockDir);
+        const observer = observeLockAttempt(lockDir);
 
         const pending = ensureBrokerSession(cwd, { env: { CODEX_COMPANION_SESSION_ID: "B" } });
 
         // While B waits, the stale broker is replaced by a different live one.
-        await sleep(200);
+        await observer.attempted;
+        observer.restore();
         saveBrokerSession(cwd, {
           endpoint: freshEndpoint,
           pidFile: null,
@@ -915,7 +967,7 @@ test("ensureBrokerSession reuses a live replacement broker after losing the lock
           sessionId: "C",
           sessionIds: ["C"]
         });
-        fs.rmdirSync(`${stateFile}.lock`);
+        fs.rmdirSync(lockDir);
 
         const session = await pending;
         assert.equal(session.endpoint, freshEndpoint);
@@ -948,6 +1000,50 @@ test("teardownBrokersForSession tolerates an unparseable broker.json and keeps c
       assert.equal(fs.existsSync(goodJson), false);
       assert.equal(requests.length, 1);
     });
+  });
+});
+
+test("teardownBrokersForSession skips symlinked and oversized broker state", async () => {
+  await withPluginData(async () => {
+    const stateRoot = stateRootForTest();
+    fs.mkdirSync(stateRoot, { recursive: true });
+    const outside = makeTempDir();
+    fs.writeFileSync(path.join(outside, "broker.json"), JSON.stringify({ sessionId: "S", pid: 12345 }));
+    fs.symlinkSync(outside, path.join(stateRoot, "symlinked-workspace"));
+
+    const linkedFileDir = path.join(stateRoot, "linked-file-workspace");
+    fs.mkdirSync(linkedFileDir);
+    fs.symlinkSync(path.join(outside, "broker.json"), path.join(linkedFileDir, "broker.json"));
+
+    const oversizedDir = path.join(stateRoot, "oversized-workspace");
+    fs.mkdirSync(oversizedDir);
+    fs.writeFileSync(path.join(oversizedDir, "broker.json"), "x".repeat(64 * 1024 + 1));
+
+    const killed = [];
+    const count = await teardownBrokersForSession("S", { killProcess: (pid) => killed.push(pid) });
+
+    assert.equal(count, 0);
+    assert.deepEqual(killed, []);
+    assert.equal(fs.existsSync(path.join(outside, "broker.json")), true);
+  });
+});
+
+test("sendBrokerShutdown returns immediately for a non-positive timeout", async () => {
+  await withHangingBroker(async ({ endpoint, requests }) => {
+    await sendBrokerShutdown(endpoint, { timeoutMs: 0 });
+    assert.equal(requests.length, 0);
+  });
+});
+
+test("teardownBrokerForCwd does not create state for an unused workspace", async () => {
+  await withPluginData(async () => {
+    const cwd = makeTempDir();
+    const stateDir = resolveStateDir(cwd);
+
+    const tornDown = await teardownBrokerForCwd(cwd, "S");
+
+    assert.equal(tornDown, false);
+    assert.equal(fs.existsSync(stateDir), false);
   });
 });
 
@@ -1051,7 +1147,7 @@ test("teardownBrokersForSession continues after one broker cleanup fails", async
   });
 });
 
-test("handleSessionEnd falls through to cwd teardown when session teardown is skipped under lock contention", async () => {
+test("handleSessionEnd skips the cwd fallback while broker state remains locked", async () => {
   await withPluginData(async () => {
     await withReadyBroker(async ({ endpoint, requests, sessionDir }) => {
       const cwd = makeTempDir();
@@ -1059,33 +1155,73 @@ test("handleSessionEnd falls through to cwd teardown when session teardown is sk
         endpoint, pidFile: null, logFile: null, sessionDir, pid: null,
         sessionId: "S", sessionIds: ["S"]
       });
-      // Hold the broker's lock so the session-keyed teardown skips it; the
-      // record then still lists the ending session as its only owner.
+      // Hold the broker's lock through both teardown attempts. The cwd fallback
+      // must not use its stale unlocked snapshot to tear the broker down.
       const lockDir = `${path.join(resolveStateDir(cwd), "broker.json")}.lock`;
       fs.mkdirSync(lockDir);
 
       try {
         await handleSessionEnd({ cwd, session_id: "S" });
-        // The cwd fallback (which does not take the lock) must still tear it
-        // down rather than leaving a broker owned only by the ended session.
-        assert.equal(loadBrokerSession(cwd), null);
-        assert.equal(requests.length, 1);
+        assert.notEqual(loadBrokerSession(cwd), null);
+        assert.equal(requests.length, 0);
       } finally {
         fs.rmSync(lockDir, { recursive: true, force: true });
       }
+
+      const reused = await ensureBrokerSession(cwd, {
+        env: { CODEX_COMPANION_SESSION_ID: "B" }
+      });
+      assert.deepEqual(reused.sessionIds, ["B"]);
+      await handleSessionEnd({ cwd, session_id: "B" });
+      assert.equal(loadBrokerSession(cwd), null);
+      assert.equal(requests.length, 1);
+    });
+  });
+});
+
+test("teardownBrokerForCwd rechecks owners under the lock before fallback teardown", async () => {
+  await withPluginData(async () => {
+    await withReadyBroker(async ({ endpoint, requests, sessionDir }) => {
+      const cwd = makeTempDir();
+      saveBrokerSession(cwd, {
+        endpoint, pidFile: null, logFile: null, sessionDir, pid: null,
+        sessionId: "A", sessionIds: ["A"]
+      });
+      const stateFile = path.join(resolveStateDir(cwd), "broker.json");
+      const lockDir = `${stateFile}.lock`;
+      fs.mkdirSync(lockDir);
+      const observer = observeLockAttempt(lockDir);
+
+      const pending = teardownBrokerForCwd(cwd, "A", {
+        killProcess: () => {},
+        lockTimeoutMs: 500
+      });
+      await observer.attempted;
+      observer.restore();
+      saveBrokerSession(cwd, {
+        endpoint, pidFile: null, logFile: null, sessionDir, pid: null,
+        sessionId: "A", sessionIds: ["A", "B"]
+      });
+      fs.rmdirSync(lockDir);
+
+      const tornDown = await pending;
+
+      assert.equal(tornDown, false);
+      assert.deepEqual(loadBrokerSession(cwd).sessionIds, ["B"]);
+      assert.equal(requests.length, 0);
     });
   });
 });
 
 test("teardownBrokersForSession caps shutdown waits to the remaining budget", async () => {
   await withPluginData(async () => {
-    await withHangingBroker(async ({ endpoint, sessionDir, destroySockets }) => {
+    await withHangingBroker(async ({ endpoint, requests, sessionDir, destroySockets }) => {
       const stateRoot = stateRootForTest();
-      writeBrokerJson(stateRoot, "worktree-hang1aaaaaaaaa", {
+      const first = writeBrokerJson(stateRoot, "worktree-hang1aaaaaaaaa", {
         endpoint, pidFile: null, logFile: null, sessionDir, pid: null,
         sessionId: "S", sessionIds: ["S"]
       });
-      writeBrokerJson(stateRoot, "worktree-hang2bbbbbbbbb", {
+      const second = writeBrokerJson(stateRoot, "worktree-hang2bbbbbbbbb", {
         endpoint, pidFile: null, logFile: null, sessionDir: null, pid: null,
         sessionId: "S", sessionIds: ["S"]
       });
@@ -1101,6 +1237,8 @@ test("teardownBrokersForSession caps shutdown waits to the remaining budget", as
         });
         const elapsed = Date.now() - startedAt;
         assert.ok(elapsed < 900, `expected budget-capped shutdown, took ${elapsed}ms`);
+        assert.equal(Number(fs.existsSync(first)) + Number(fs.existsSync(second)), 1);
+        assert.equal(requests.length, 1);
       } finally {
         destroySockets();
       }

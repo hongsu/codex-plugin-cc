@@ -8,16 +8,12 @@ import { fileURLToPath } from "node:url";
 import { terminateProcessTree } from "./lib/process.mjs";
 import { BROKER_ENDPOINT_ENV } from "./lib/app-server.mjs";
 import {
-  clearBrokerSession,
-  hasOtherBrokerSessionOwners,
   LOG_FILE_ENV,
-  loadBrokerSession,
   PID_FILE_ENV,
-  sendBrokerShutdown,
-  teardownBrokerSession,
+  teardownBrokerForCwd,
   teardownBrokersForSession
 } from "./lib/broker-lifecycle.mjs";
-import { loadState, resolveStateFile, resolveStateRoot, saveState } from "./lib/state.mjs";
+import { removeSessionJobs, resolveStateFile, resolveStateRoot } from "./lib/state.mjs";
 import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
@@ -50,14 +46,15 @@ function appendEnvVar(name, value) {
   fs.appendFileSync(process.env.CLAUDE_ENV_FILE, `export ${name}=${shellEscape(value)}\n`, "utf8");
 }
 
-function cleanupWorkspaceSessionJobs(workspaceRoot, sessionId) {
+function cleanupWorkspaceSessionJobs(workspaceRoot, sessionId, deadline) {
   const stateFile = resolveStateFile(workspaceRoot);
   if (!fs.existsSync(stateFile)) {
     return;
   }
 
-  const state = loadState(workspaceRoot);
-  const removedJobs = state.jobs.filter((job) => job.sessionId === sessionId);
+  const removedJobs = removeSessionJobs(workspaceRoot, sessionId, {
+    timeoutMs: Math.max(0, deadline - Date.now())
+  });
   if (removedJobs.length === 0) {
     return;
   }
@@ -73,11 +70,6 @@ function cleanupWorkspaceSessionJobs(workspaceRoot, sessionId) {
       // Ignore teardown failures during session shutdown.
     }
   }
-
-  saveState(workspaceRoot, {
-    ...state,
-    jobs: state.jobs.filter((job) => job.sessionId !== sessionId)
-  });
 }
 
 function readSessionJobsFromStateFile(stateFile) {
@@ -167,7 +159,7 @@ function cleanupSessionJobs(cwd, sessionId, deadline) {
     }
     workspaceIndex += 1;
     try {
-      cleanupWorkspaceSessionJobs(workspaceRoot, sessionId);
+      cleanupWorkspaceSessionJobs(workspaceRoot, sessionId, deadline);
     } catch (error) {
       cleanupError ??= error;
     }
@@ -201,47 +193,25 @@ export async function handleSessionEnd(input) {
       await teardownBrokersForSession(sessionId, {
         killProcess: terminateProcessTree,
         lockTimeoutMs: SESSION_END_LOCK_TIMEOUT_MS,
-        budgetMs: Math.max(0, cleanupDeadline - Date.now())
+        budgetMs: Math.max(0, cleanupDeadline - Date.now()),
+        excludeCwd: cwd
       });
     } catch (error) {
       cleanupError ??= error;
     }
   }
 
-  const brokerSession =
-    loadBrokerSession(cwd) ??
-    (process.env[BROKER_ENDPOINT_ENV]
+  await teardownBrokerForCwd(cwd, sessionId, {
+    fallbackSession: process.env[BROKER_ENDPOINT_ENV]
       ? {
           endpoint: process.env[BROKER_ENDPOINT_ENV],
           pidFile: process.env[PID_FILE_ENV] ?? null,
           logFile: process.env[LOG_FILE_ENV] ?? null
         }
-      : null);
-  if (sessionId && hasOtherBrokerSessionOwners(brokerSession, sessionId)) {
-    if (cleanupError) {
-      throw cleanupError;
-    }
-    return;
-  }
-  const brokerEndpoint = brokerSession?.endpoint ?? null;
-  const pidFile = brokerSession?.pidFile ?? null;
-  const logFile = brokerSession?.logFile ?? null;
-  const sessionDir = brokerSession?.sessionDir ?? null;
-  const pid = brokerSession?.pid ?? null;
-
-  if (brokerEndpoint) {
-    await sendBrokerShutdown(brokerEndpoint);
-  }
-
-  teardownBrokerSession({
-    endpoint: brokerEndpoint,
-    pidFile,
-    logFile,
-    sessionDir,
-    pid,
-    killProcess: terminateProcessTree
+      : null,
+    killProcess: terminateProcessTree,
+    lockTimeoutMs: SESSION_END_LOCK_TIMEOUT_MS
   });
-  clearBrokerSession(cwd);
   if (cleanupError) {
     throw cleanupError;
   }
