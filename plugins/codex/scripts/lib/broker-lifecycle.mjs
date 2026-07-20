@@ -751,7 +751,10 @@ export async function ensureBrokerSession(cwd, options = {}) {
       }
       clearEndedOwnerMarkers(pending.markerFiles);
       return withOwner;
-    }, lockOptions);
+    }, {
+      ...lockOptions,
+      ownerSessionId: resolveSessionId(options)
+    });
     if (reused) {
       return reused;
     }
@@ -935,7 +938,8 @@ export async function teardownBrokersForSession(
       }
       const stateExists = fs.existsSync(stateFile);
       const lockDir = `${stateFile}.lock`;
-      if (!stateExists && readBrokerLockSession(lockDir) !== sessionId) {
+      const lockSessionId = readBrokerLockSession(lockDir);
+      if (!stateExists && lockSessionId !== sessionId) {
         continue;
       }
 
@@ -954,7 +958,11 @@ export async function teardownBrokersForSession(
           preview = null;
         }
       }
-      if (preview && !brokerSessionOwners(preview).includes(sessionId)) {
+      if (
+        preview &&
+        !brokerSessionOwners(preview).includes(sessionId) &&
+        lockSessionId !== sessionId
+      ) {
         continue;
       }
       try {

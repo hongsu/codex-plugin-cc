@@ -1300,6 +1300,49 @@ test("mismatched-cwd SessionEnd marks an in-flight broker spawn before broker.js
   });
 });
 
+test("session-wide teardown marks a session joining a ready broker under its lock", async () => {
+  await withPluginData(async () => {
+    await withReadyBroker(async ({ endpoint, requests, sessionDir }) => {
+      const cwd = makeTempDir();
+      saveBrokerSession(cwd, {
+        endpoint,
+        pidFile: null,
+        logFile: null,
+        sessionDir,
+        pid: null,
+        sessionId: "A",
+        sessionIds: ["A"]
+      });
+      const stateFile = path.join(resolveStateDir(cwd), "broker.json");
+      const lockDir = `${stateFile}.lock`;
+      fs.mkdirSync(lockDir);
+      fs.writeFileSync(path.join(lockDir, "owner"), `${process.pid}-ready-reuse`, "utf8");
+      fs.writeFileSync(path.join(lockDir, "session"), "S", "utf8");
+
+      try {
+        await assert.rejects(
+          () => teardownBrokersForSession("S", {
+            killProcess: () => {},
+            lockTimeoutMs: 50
+          }),
+          { code: BROKER_CLEANUP_INCOMPLETE_CODE, reason: "lock-timeout" }
+        );
+      } finally {
+        fs.rmSync(lockDir, { recursive: true, force: true });
+      }
+
+      await assert.rejects(
+        () => ensureBrokerSession(cwd, {
+          env: { CODEX_COMPANION_SESSION_ID: "S" }
+        }),
+        { code: BROKER_OWNER_ENDED_CODE }
+      );
+      assert.deepEqual(loadBrokerSession(cwd).sessionIds, ["A"]);
+      assert.equal(requests.length, 0);
+    });
+  });
+});
+
 test("CodexAppServerClient does not fall back to a direct app-server after its broker owner ends", async () => {
   await withPluginData(async () => {
     const cwd = makeTempDir();
