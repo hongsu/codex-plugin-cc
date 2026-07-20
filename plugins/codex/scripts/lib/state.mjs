@@ -12,7 +12,6 @@ const STATE_FILE_NAME = "state.json";
 const JOBS_DIR_NAME = "jobs";
 const MAX_JOBS = 50;
 const STATE_LOCK_TIMEOUT_MS = 5000;
-const STATE_LOCK_STALE_MS = 30000;
 const STATE_LOCK_TIMEOUT_CODE = "ESTATELOCKTIMEOUT";
 
 let stateWriteSequence = 0;
@@ -200,7 +199,7 @@ function withStateFileLock(cwd, fn, { timeoutMs = STATE_LOCK_TIMEOUT_MS } = {}) 
           stat = null;
         }
       }
-      if (stat && Date.now() - stat.mtimeMs > STATE_LOCK_STALE_MS) {
+      if (stat) {
         let ownerToken = null;
         try {
           ownerToken = fs.readFileSync(tokenFile, "utf8");

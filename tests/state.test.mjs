@@ -179,17 +179,17 @@ test("saveState does not release a state lock that has a replacement owner", () 
   fs.rmSync(lockDir, { recursive: true, force: true });
 });
 
-test("saveState reclaims an aged lock whose owner process exited", () => {
+test("saveState immediately reclaims a fresh lock whose owner process exited", () => {
   const workspace = makeTempDir();
   const stateFile = resolveStateFile(workspace);
   const lockDir = `${stateFile}.lock`;
   fs.mkdirSync(lockDir, { recursive: true });
   fs.writeFileSync(path.join(lockDir, "owner"), "2147483647-crashed", "utf8");
-  const old = new Date(Date.now() - 120000);
-  fs.utimesSync(lockDir, old, old);
 
+  const startedAt = Date.now();
   saveState(workspace, { jobs: [] });
 
+  assert.ok(Date.now() - startedAt < 1000);
   assert.equal(fs.existsSync(lockDir), false);
   assert.deepEqual(loadState(workspace).jobs, []);
 });

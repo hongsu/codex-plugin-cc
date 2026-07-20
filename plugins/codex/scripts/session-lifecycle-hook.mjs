@@ -49,29 +49,39 @@ function appendEnvVar(name, value) {
 function cleanupWorkspaceSessionJobs(workspaceRoot, sessionId, deadline) {
   const stateFile = resolveStateFile(workspaceRoot);
   if (!fs.existsSync(stateFile)) {
-    return;
+    return { brokerTeardownSafe: true, error: null };
+  }
+  if (!readSessionJobsFromStateFile(stateFile).complete) {
+    return { brokerTeardownSafe: false, error: null };
   }
 
-  removeSessionJobs(
-    workspaceRoot,
-    sessionId,
-    {
-      timeoutMs: Math.max(0, deadline - Date.now()),
-      beforeRemove(jobs) {
-        for (const job of jobs) {
-          const stillRunning = job.status === "queued" || job.status === "running";
-          if (!stillRunning) {
-            continue;
-          }
-          try {
-            terminateProcessTree(job.pid ?? Number.NaN);
-          } catch {
-            // Ignore teardown failures during session shutdown.
+  let reachedTerminationPhase = false;
+  try {
+    removeSessionJobs(
+      workspaceRoot,
+      sessionId,
+      {
+        timeoutMs: Math.max(0, deadline - Date.now()),
+        beforeRemove(jobs) {
+          reachedTerminationPhase = true;
+          for (const job of jobs) {
+            const stillRunning = job.status === "queued" || job.status === "running";
+            if (!stillRunning) {
+              continue;
+            }
+            try {
+              terminateProcessTree(job.pid ?? Number.NaN);
+            } catch {
+              // Ignore teardown failures during session shutdown.
+            }
           }
         }
       }
-    }
-  );
+    );
+    return { brokerTeardownSafe: true, error: null };
+  } catch (error) {
+    return { brokerTeardownSafe: reachedTerminationPhase, error };
+  }
 }
 
 function readSessionJobsFromStateFile(stateFile) {
@@ -146,10 +156,12 @@ function findSessionJobWorkspaces(cwd, sessionId, deadline) {
 
 function cleanupSessionJobs(cwd, sessionId, deadline) {
   if (!cwd || !sessionId) {
-    return { discoveryComplete: true, error: null };
+    return { discoveryComplete: true, cwdBrokerTeardownSafe: true, error: null };
   }
 
   let cleanupError = null;
+  let jobCleanupComplete = true;
+  let cwdBrokerTeardownSafe = true;
   let workspaceIndex = 0;
   const discovery = findSessionJobWorkspaces(cwd, sessionId, deadline);
   for (const workspaceRoot of discovery.workspaceRoots) {
@@ -161,12 +173,27 @@ function cleanupSessionJobs(cwd, sessionId, deadline) {
     }
     workspaceIndex += 1;
     try {
-      cleanupWorkspaceSessionJobs(workspaceRoot, sessionId, deadline);
+      const cleanup = cleanupWorkspaceSessionJobs(workspaceRoot, sessionId, deadline);
+      cleanupError ??= cleanup.error;
+      if (!cleanup.brokerTeardownSafe) {
+        jobCleanupComplete = false;
+        if (workspaceIndex === 1) {
+          cwdBrokerTeardownSafe = false;
+        }
+      }
     } catch (error) {
       cleanupError ??= error;
+      jobCleanupComplete = false;
+      if (workspaceIndex === 1) {
+        cwdBrokerTeardownSafe = false;
+      }
     }
   }
-  return { discoveryComplete: discovery.complete, error: cleanupError };
+  return {
+    discoveryComplete: discovery.complete && jobCleanupComplete,
+    cwdBrokerTeardownSafe,
+    error: cleanupError
+  };
 }
 
 function handleSessionStart(input) {
@@ -181,13 +208,16 @@ export async function handleSessionEnd(input) {
   const cleanupDeadline = Date.now() + SESSION_END_CLEANUP_BUDGET_MS;
   let cleanupError = null;
   let jobDiscoveryComplete = true;
+  let cwdBrokerTeardownSafe = true;
   try {
     const cleanup = cleanupSessionJobs(cwd, sessionId, cleanupDeadline);
     cleanupError = cleanup.error;
     jobDiscoveryComplete = cleanup.discoveryComplete;
+    cwdBrokerTeardownSafe = cleanup.cwdBrokerTeardownSafe;
   } catch (error) {
     cleanupError = error;
     jobDiscoveryComplete = false;
+    cwdBrokerTeardownSafe = false;
   }
 
   if (sessionId && jobDiscoveryComplete) {
@@ -203,17 +233,19 @@ export async function handleSessionEnd(input) {
     }
   }
 
-  await teardownBrokerForCwd(cwd, sessionId, {
-    fallbackSession: process.env[BROKER_ENDPOINT_ENV]
-      ? {
-          endpoint: process.env[BROKER_ENDPOINT_ENV],
-          pidFile: process.env[PID_FILE_ENV] ?? null,
-          logFile: process.env[LOG_FILE_ENV] ?? null
-        }
-      : null,
-    killProcess: terminateProcessTree,
-    lockTimeoutMs: SESSION_END_LOCK_TIMEOUT_MS
-  });
+  if (cwdBrokerTeardownSafe) {
+    await teardownBrokerForCwd(cwd, sessionId, {
+      fallbackSession: process.env[BROKER_ENDPOINT_ENV]
+        ? {
+            endpoint: process.env[BROKER_ENDPOINT_ENV],
+            pidFile: process.env[PID_FILE_ENV] ?? null,
+            logFile: process.env[LOG_FILE_ENV] ?? null
+          }
+        : null,
+      killProcess: terminateProcessTree,
+      lockTimeoutMs: SESSION_END_LOCK_TIMEOUT_MS
+    });
+  }
   if (cleanupError) {
     throw cleanupError;
   }

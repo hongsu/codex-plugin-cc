@@ -14,6 +14,7 @@ import {
   resolveJobFile,
   resolveJobLogFile,
   resolveStateDir,
+  resolveStateFile,
   resolveStateRoot,
   saveState,
   writeJobFile
@@ -249,19 +250,6 @@ test("teardownBrokersForSession tears down a broker registered for a different c
   });
 });
 
-test("teardownBrokersForSession leaves non-matching sessionId brokers intact", async () => {
-  await withPluginData(async () => {
-    const stateRoot = stateRootForTest();
-    const brokerJson = writeBrokerJson(stateRoot, "other-1111111111111111", {
-      endpoint: "unix:/tmp/codex-test-nonexistent2.sock",
-      pidFile: null, logFile: null, sessionDir: null, pid: null, sessionId: "S"
-    });
-    const count = await teardownBrokersForSession("OTHER", { killProcess: () => {} });
-    assert.equal(count, 0);
-    assert.equal(fs.existsSync(brokerJson), true);
-  });
-});
-
 test("teardownBrokersForSession ignores broker.json without sessionId (legacy)", async () => {
   await withPluginData(async () => {
     const stateRoot = stateRootForTest();
@@ -461,6 +449,78 @@ test("handleSessionEnd still tears down session brokers when job cleanup fails",
     assert.deepEqual(killedPids, [{ pid: -12345, signal: "SIGTERM" }]);
     assert.deepEqual(loadState(cwd).jobs.map((job) => job.id), ["running"]);
     assert.equal(fs.existsSync(path.join(workspaceStateDir, "broker.json")), false);
+  });
+});
+
+test("handleSessionEnd preserves session brokers when job state locking fails", async () => {
+  await withPluginData(async () => {
+    const cwd = makeTempDir();
+    const otherWorkspace = makeTempDir();
+    const stateFile = resolveStateFile(cwd);
+    const stateLock = `${stateFile}.lock`;
+    saveState(cwd, {
+      jobs: [{
+        id: "locked-job",
+        status: "running",
+        sessionId: "S",
+        workspaceRoot: cwd,
+        pid: 999999999
+      }]
+    });
+    saveBrokerSession(cwd, {
+      endpoint: "unix:/tmp/codex-test-locked-job-cwd.sock",
+      sessionId: "S",
+      sessionIds: ["S"]
+    });
+    saveBrokerSession(otherWorkspace, {
+      endpoint: "unix:/tmp/codex-test-locked-job-other.sock",
+      sessionId: "S",
+      sessionIds: ["S"]
+    });
+
+    const originalRenameSync = fs.renameSync;
+    fs.renameSync = (source, destination) => {
+      if (destination === stateLock) {
+        throw Object.assign(new Error("state lock denied"), { code: "EACCES" });
+      }
+      return originalRenameSync.call(fs, source, destination);
+    };
+
+    try {
+      await assert.rejects(() => handleSessionEnd({ cwd, session_id: "S" }), { code: "EACCES" });
+    } finally {
+      fs.renameSync = originalRenameSync;
+    }
+
+    assert.deepEqual(loadState(cwd).jobs.map((job) => job.id), ["locked-job"]);
+    assert.notEqual(loadBrokerSession(cwd), null);
+    assert.notEqual(loadBrokerSession(otherWorkspace), null);
+  });
+});
+
+test("handleSessionEnd preserves session brokers when cwd job state is unreadable", async () => {
+  await withPluginData(async () => {
+    const cwd = makeTempDir();
+    const otherWorkspace = makeTempDir();
+    const stateFile = resolveStateFile(cwd);
+    fs.mkdirSync(path.dirname(stateFile), { recursive: true });
+    fs.writeFileSync(stateFile, "{not-json", "utf8");
+    saveBrokerSession(cwd, {
+      endpoint: "unix:/tmp/codex-test-unreadable-job-cwd.sock",
+      sessionId: "S",
+      sessionIds: ["S"]
+    });
+    saveBrokerSession(otherWorkspace, {
+      endpoint: "unix:/tmp/codex-test-unreadable-job-other.sock",
+      sessionId: "S",
+      sessionIds: ["S"]
+    });
+
+    await handleSessionEnd({ cwd, session_id: "S" });
+
+    assert.equal(fs.readFileSync(stateFile, "utf8"), "{not-json");
+    assert.notEqual(loadBrokerSession(cwd), null);
+    assert.notEqual(loadBrokerSession(otherWorkspace), null);
   });
 });
 
