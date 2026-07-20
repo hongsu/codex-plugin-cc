@@ -11,6 +11,7 @@ import {
   BROKER_CLEANUP_INCOMPLETE_CODE,
   LOG_FILE_ENV,
   PID_FILE_ENV,
+  markBrokerSessionEnded,
   teardownBrokerForCwd,
   teardownBrokersForSession
 } from "./lib/broker-lifecycle.mjs";
@@ -218,15 +219,20 @@ export async function handleSessionEnd(input) {
   const sessionId = input.session_id || process.env[SESSION_ID_ENV];
   const cleanupDeadline = Date.now() + SESSION_END_CLEANUP_BUDGET_MS;
   let cleanupError = null;
+  try {
+    markBrokerSessionEnded(sessionId);
+  } catch (error) {
+    cleanupError = error;
+  }
   let jobDiscoveryComplete = true;
   let cwdBrokerTeardownSafe = true;
   try {
     const cleanup = cleanupSessionJobs(cwd, sessionId, cleanupDeadline);
-    cleanupError = cleanup.error;
+    cleanupError ??= cleanup.error;
     jobDiscoveryComplete = cleanup.discoveryComplete;
     cwdBrokerTeardownSafe = cleanup.cwdBrokerTeardownSafe;
   } catch (error) {
-    cleanupError = error;
+    cleanupError ??= error;
     jobDiscoveryComplete = false;
     cwdBrokerTeardownSafe = false;
   }

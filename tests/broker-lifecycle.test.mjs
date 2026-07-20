@@ -23,6 +23,7 @@ import {
   BROKER_CLEANUP_INCOMPLETE_CODE,
   BROKER_OWNER_ENDED_CODE,
   ensureBrokerSession,
+  isBrokerSessionEnded,
   loadBrokerSession,
   resolveSessionId,
   saveBrokerSession,
@@ -698,6 +699,7 @@ test("handleSessionEnd reports incomplete cleanup when job-state discovery is in
 
     assert.equal(loadState(jobWorkspace).jobs.length, 1);
     assert.notEqual(loadBrokerSession(jobWorkspace), null);
+    assert.equal(isBrokerSessionEnded("S"), true);
   });
 });
 
@@ -1384,9 +1386,93 @@ test("CodexAppServerClient does not fall back to a direct app-server after its b
   });
 });
 
+test("CodexAppServerClient rejects an ended session before using a supplied broker endpoint", async () => {
+  await withPluginData(async () => {
+    const cwd = makeTempDir();
+    await teardownBrokerForCwd(cwd, "S", { killProcess: () => {} });
+
+    await assert.rejects(
+      () => CodexAppServerClient.connect(cwd, {
+        brokerEndpoint: createBrokerEndpoint(path.join(makeTempDir(), "broker.sock")),
+        env: { CODEX_COMPANION_SESSION_ID: "S" }
+      }),
+      { code: BROKER_OWNER_ENDED_CODE }
+    );
+  });
+});
+
+test("CodexAppServerClient rejects a supplied endpoint when its session ends during initialize", async () => {
+  await withPluginData(async () => {
+    const cwd = makeTempDir();
+    const sessionDir = makeTempDir();
+    const endpoint = createBrokerEndpoint(sessionDir);
+    const target = parseBrokerEndpoint(endpoint);
+    let releaseInitialize;
+    const initializeReceived = new Promise((resolve) => {
+      releaseInitialize = resolve;
+    });
+    let socket = null;
+    const server = net.createServer((connected) => {
+      socket = connected;
+      connected.once("data", () => releaseInitialize());
+    });
+    await new Promise((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(target.path, () => {
+        server.off("error", reject);
+        resolve();
+      });
+    });
+
+    try {
+      const pending = CodexAppServerClient.connect(cwd, {
+        brokerEndpoint: endpoint,
+        env: { CODEX_COMPANION_SESSION_ID: "S" }
+      });
+      await initializeReceived;
+      await teardownBrokerForCwd(cwd, "S", { killProcess: () => {} });
+      socket.write(`${JSON.stringify({ id: 1, result: {} })}\n`);
+
+      await assert.rejects(pending, { code: BROKER_OWNER_ENDED_CODE });
+    } finally {
+      socket?.destroy();
+      await new Promise((resolve) => server.close(resolve));
+    }
+  });
+});
+
+test("CodexAppServerClient rejects an ended session before direct fallback", async () => {
+  await withPluginData(async () => {
+    const cwd = makeTempDir();
+    const directMarker = path.join(makeTempDir(), "direct-spawned");
+    const fakeBin = makeTempDir();
+    const fakeCodex = path.join(fakeBin, "codex");
+    fs.writeFileSync(
+      fakeCodex,
+      `#!/bin/sh\nprintf spawned > "${directMarker}"\nexit 1\n`,
+      { encoding: "utf8", mode: 0o755 }
+    );
+    await teardownBrokerForCwd(cwd, "S", { killProcess: () => {} });
+
+    await assert.rejects(
+      () => CodexAppServerClient.connect(cwd, {
+        disableBroker: true,
+        env: {
+          ...process.env,
+          PATH: `${fakeBin}${path.delimiter}${process.env.PATH ?? ""}`,
+          CODEX_COMPANION_SESSION_ID: "S"
+        }
+      }),
+      { code: BROKER_OWNER_ENDED_CODE }
+    );
+    assert.equal(fs.existsSync(directMarker), false);
+  });
+});
+
 test("CodexAppServerClient does not fall back after an ended owner's broker spawn times out", async () => {
   await withPluginData(async () => {
     const cwd = makeTempDir();
+    const stateFile = path.join(resolveStateDir(cwd), "broker.json");
     const spawnMarker = path.join(makeTempDir(), "broker-spawned");
     const directMarker = path.join(makeTempDir(), "direct-spawned");
     const fakeBin = makeTempDir();
@@ -1405,15 +1491,16 @@ test("CodexAppServerClient does not fall back after an ended owner's broker spaw
         TEST_BROKER_SPAWN_MARKER: spawnMarker,
         TEST_BROKER_LISTEN_DELAY_MS: "1000"
       },
-      brokerOptions: { scriptPath: writeFakeBrokerScript(), timeoutMs: 100 }
+      brokerOptions: { scriptPath: writeFakeBrokerScript(), timeoutMs: 2000 }
     });
     const rejected = assert.rejects(pending, { code: BROKER_OWNER_ENDED_CODE });
 
     const deadline = Date.now() + 2000;
-    while (!fs.existsSync(spawnMarker) && Date.now() < deadline) {
+    while ((!fs.existsSync(spawnMarker) || !fs.existsSync(`${stateFile}.lock`)) && Date.now() < deadline) {
       await sleep(10);
     }
     assert.equal(fs.existsSync(spawnMarker), true);
+    assert.equal(fs.existsSync(`${stateFile}.lock`), true);
     await assert.rejects(
       () => teardownBrokerForCwd(cwd, "S", { killProcess: () => {}, lockTimeoutMs: 50 }),
       { code: BROKER_CLEANUP_INCOMPLETE_CODE, reason: "lock-timeout" }
@@ -1576,15 +1663,14 @@ test("sendBrokerShutdown returns immediately for a non-positive timeout", async 
   });
 });
 
-test("teardownBrokerForCwd records an ended owner before the first broker lock exists", async () => {
+test("teardownBrokerForCwd records a global ended session before the first broker lock exists", async () => {
   await withPluginData(async () => {
     const cwd = makeTempDir();
-    const stateDir = resolveStateDir(cwd);
-
     const tornDown = await teardownBrokerForCwd(cwd, "S");
 
     assert.equal(tornDown, false);
-    assert.equal(fs.existsSync(stateDir), true);
+    assert.equal(isBrokerSessionEnded("S"), true);
+    assert.equal(fs.existsSync(resolveStateDir(cwd)), false);
     await assert.rejects(
       () => ensureBrokerSession(cwd, { env: { CODEX_COMPANION_SESSION_ID: "S" } }),
       { code: BROKER_OWNER_ENDED_CODE }
@@ -1693,21 +1779,20 @@ test("teardownBrokersForSession continues after one broker cleanup fails", async
   });
 });
 
-test("teardownBrokersForSession continues after one ended-owner marker write fails", async () => {
+test("teardownBrokersForSession does not mutate brokers when the global end marker cannot be published", async () => {
   await withPluginData(async () => {
     const stateRoot = stateRootForTest();
-    const firstJson = writeBrokerJson(stateRoot, "worktree-0000markerfail", {
+    const firstJson = writeBrokerJson(stateRoot, "worktree-0000first", {
       endpoint: "unix:/tmp/codex-test-marker-failure.sock",
       sessionId: "S"
     });
-    const secondJson = writeBrokerJson(stateRoot, "worktree-9999markersuccess", {
+    const secondJson = writeBrokerJson(stateRoot, "worktree-9999second", {
       endpoint: "unix:/tmp/codex-test-marker-success.sock",
       sessionId: "S"
     });
-    const firstDir = path.dirname(firstJson);
     const originalWriteFileSync = fs.writeFileSync.bind(fs);
     fs.writeFileSync = (file, ...args) => {
-      if (path.dirname(String(file)) === firstDir && path.basename(String(file)).startsWith("broker.json.ended-")) {
+      if (path.dirname(String(file)) === path.join(stateRoot, ".ended-sessions")) {
         throw Object.assign(new Error("simulated marker write failure"), { code: "EACCES" });
       }
       return originalWriteFileSync(file, ...args);
@@ -1723,49 +1808,34 @@ test("teardownBrokersForSession continues after one ended-owner marker write fai
     }
 
     assert.equal(fs.existsSync(firstJson), true);
-    assert.equal(fs.existsSync(secondJson), false);
+    assert.equal(fs.existsSync(secondJson), true);
   });
 });
 
-test("teardownBrokersForSession preserves incomplete status when later cleanup also fails", async () => {
+test("an unrelated broker reuse cannot consume another session's ended status", async () => {
   await withPluginData(async () => {
-    const stateRoot = stateRootForTest();
-    const lockedJson = writeBrokerJson(stateRoot, "worktree-0000locked", {
-      endpoint: "unix:/tmp/codex-test-locked-first.sock",
-      sessionId: "S"
-    });
-    const failedJson = writeBrokerJson(stateRoot, "worktree-9999markerfail", {
-      endpoint: "unix:/tmp/codex-test-marker-failure-later.sock",
-      sessionId: "S"
-    });
-    const failedDir = path.dirname(failedJson);
-    const lockDir = `${lockedJson}.lock`;
-    fs.mkdirSync(lockDir);
-    const originalWriteFileSync = fs.writeFileSync.bind(fs);
-    fs.writeFileSync = (file, ...args) => {
-      if (path.dirname(String(file)) === failedDir && path.basename(String(file)).startsWith("broker.json.ended-")) {
-        throw Object.assign(new Error("simulated later marker failure"), { code: "EACCES" });
-      }
-      return originalWriteFileSync(file, ...args);
-    };
+    await withReadyBroker(async ({ endpoint, sessionDir }) => {
+      const cwd = makeTempDir();
+      saveBrokerSession(cwd, {
+        endpoint, pidFile: null, logFile: null, sessionDir, pid: null,
+        sessionId: "A", sessionIds: ["A"]
+      });
 
-    try {
+      assert.equal(await teardownBrokerForCwd(makeTempDir(), "S"), false);
+      assert.equal(isBrokerSessionEnded("S"), true);
+
+      const reused = await ensureBrokerSession(cwd, {
+        env: { CODEX_COMPANION_SESSION_ID: "C" }
+      });
+      assert.deepEqual(reused.sessionIds, ["A", "C"]);
+      assert.equal(isBrokerSessionEnded("S"), true);
+
       await assert.rejects(
-        () => teardownBrokersForSession("S", { killProcess: () => {}, lockTimeoutMs: 50 }),
-        (error) => {
-          assert.equal(error.code, BROKER_CLEANUP_INCOMPLETE_CODE);
-          assert.equal(error.reason, "lock-timeout");
-          assert.equal(error.cause?.code, "EACCES");
-          return true;
-        }
+        () => ensureBrokerSession(cwd, { env: { CODEX_COMPANION_SESSION_ID: "S" } }),
+        { code: BROKER_OWNER_ENDED_CODE }
       );
-    } finally {
-      fs.writeFileSync = originalWriteFileSync;
-      fs.rmSync(lockDir, { recursive: true, force: true });
-    }
-
-    assert.equal(fs.existsSync(lockedJson), true);
-    assert.equal(fs.existsSync(failedJson), true);
+      assert.deepEqual(loadBrokerSession(cwd).sessionIds, ["A", "C"]);
+    });
   });
 });
 
