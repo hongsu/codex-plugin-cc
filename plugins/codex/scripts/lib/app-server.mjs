@@ -13,7 +13,7 @@ import process from "node:process";
 import { spawn } from "node:child_process";
 import readline from "node:readline";
 import { parseBrokerEndpoint } from "./broker-endpoint.mjs";
-import { ensureBrokerSession, loadBrokerSession } from "./broker-lifecycle.mjs";
+import { ensureBrokerSession, resolveSessionId, reuseBrokerSession } from "./broker-lifecycle.mjs";
 import { terminateProcessTree } from "./process.mjs";
 
 const PLUGIN_MANIFEST_URL = new URL("../../.claude-plugin/plugin.json", import.meta.url);
@@ -337,11 +337,21 @@ export class CodexAppServerClient {
     let brokerEndpoint = null;
     if (!options.disableBroker) {
       brokerEndpoint = options.brokerEndpoint ?? options.env?.[BROKER_ENDPOINT_ENV] ?? process.env[BROKER_ENDPOINT_ENV] ?? null;
-      if (!brokerEndpoint && options.reuseExistingBroker) {
-        brokerEndpoint = loadBrokerSession(cwd)?.endpoint ?? null;
+      const sessionId = resolveSessionId({ env: options.env });
+      if (!brokerEndpoint && sessionId && options.reuseExistingBroker) {
+        const brokerSession = await reuseBrokerSession(cwd, {
+          ...options.brokerOptions,
+          env: options.env,
+          killProcess: terminateProcessTree
+        });
+        brokerEndpoint = brokerSession?.endpoint ?? null;
       }
-      if (!brokerEndpoint && !options.reuseExistingBroker) {
-        const brokerSession = await ensureBrokerSession(cwd, { env: options.env });
+      if (!brokerEndpoint && sessionId && !options.reuseExistingBroker) {
+        const brokerSession = await ensureBrokerSession(cwd, {
+          ...options.brokerOptions,
+          env: options.env,
+          killProcess: terminateProcessTree
+        });
         brokerEndpoint = brokerSession?.endpoint ?? null;
       }
     }

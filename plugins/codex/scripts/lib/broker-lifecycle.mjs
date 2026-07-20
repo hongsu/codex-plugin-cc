@@ -13,12 +13,14 @@ export const PID_FILE_ENV = "CODEX_COMPANION_APP_SERVER_PID_FILE";
 export const LOG_FILE_ENV = "CODEX_COMPANION_APP_SERVER_LOG_FILE";
 const BROKER_STATE_FILE = "broker.json";
 const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
-const BROKER_STATE_LOCK_STALE_MS = 30000;
 const BROKER_STATE_LOCK_TIMEOUT_MS = 5000;
 const BROKER_SHUTDOWN_TIMEOUT_MS = 1000;
 const BROKER_LOCK_TIMEOUT_CODE = "EBROKERSTATELOCKTIMEOUT";
+export const BROKER_OWNER_ENDED_CODE = "EBROKEROWNERENDED";
+export const BROKER_CLEANUP_INCOMPLETE_CODE = "EBROKERCLEANUPINCOMPLETE";
 const MAX_BROKER_STATE_BYTES = 64 * 1024;
 const ENDED_OWNER_MARKER_PREFIX = `${BROKER_STATE_FILE}.ended-`;
+const BROKER_LOCK_SESSION_FILE = "session";
 
 let brokerLockTokenSeq = 0;
 
@@ -62,6 +64,22 @@ async function sleep(ms) {
 
 function isBrokerLockTimeout(error) {
   return error?.code === BROKER_LOCK_TIMEOUT_CODE;
+}
+
+function brokerOwnerEndedError(sessionId) {
+  return Object.assign(
+    new Error(`Broker owner session ${sessionId ?? "unknown"} ended while the broker was starting.`),
+    { code: BROKER_OWNER_ENDED_CODE }
+  );
+}
+
+function brokerCleanupIncompleteError(reason, count = 0, cause = null) {
+  return Object.assign(new Error(`Broker cleanup stopped before completion: ${reason}.`), {
+    code: BROKER_CLEANUP_INCOMPLETE_CODE,
+    count,
+    reason,
+    ...(cause ? { cause } : {})
+  });
 }
 
 function isLockOwnerAlive(token) {
@@ -166,7 +184,6 @@ async function withBrokerStateFileLock(stateFile, fn, options = {}) {
   const tokenFile = path.join(lockDir, "owner");
   const token = `${process.pid}-${brokerLockTokenSeq += 1}`;
   const timeoutMs = options.timeoutMs ?? BROKER_STATE_LOCK_TIMEOUT_MS;
-  const staleMs = options.staleMs ?? BROKER_STATE_LOCK_STALE_MS;
   const deadline = Date.now() + timeoutMs;
   fs.mkdirSync(path.dirname(stateFile), { recursive: true });
 
@@ -187,6 +204,13 @@ async function withBrokerStateFileLock(stateFile, fn, options = {}) {
       }
       candidate = fs.mkdtempSync(`${lockDir}.candidate-${process.pid}-`);
       fs.writeFileSync(path.join(candidate, "owner"), token, { encoding: "utf8", flag: "wx" });
+      const ownerSessionId = options.ownerSessionId;
+      if (ownerSessionId && Buffer.byteLength(ownerSessionId, "utf8") <= 1024) {
+        fs.writeFileSync(path.join(candidate, BROKER_LOCK_SESSION_FILE), ownerSessionId, {
+          encoding: "utf8",
+          flag: "wx"
+        });
+      }
       fs.renameSync(candidate, lockDir);
       candidate = null;
       if (recoverBrokerReclaimBarriers(lockDir)) {
@@ -237,7 +261,7 @@ async function withBrokerStateFileLock(stateFile, fn, options = {}) {
         }
         stat = null;
       }
-      if (stat && Date.now() - stat.mtimeMs > staleMs) {
+      if (stat) {
         let ownerToken = null;
         try {
           ownerToken = fs.readFileSync(tokenFile, "utf8");
@@ -421,6 +445,36 @@ function readBrokerStateFile(stateFile) {
   }
 }
 
+function readBrokerLockSession(lockDir) {
+  const sessionFile = path.join(lockDir, BROKER_LOCK_SESSION_FILE);
+  let descriptor = null;
+  try {
+    const before = fs.lstatSync(sessionFile);
+    if (!before.isFile() || before.size > 1024) {
+      return null;
+    }
+    const noFollow = fs.constants.O_NOFOLLOW ?? 0;
+    const nonBlock = fs.constants.O_NONBLOCK ?? 0;
+    descriptor = fs.openSync(sessionFile, fs.constants.O_RDONLY | noFollow | nonBlock);
+    const opened = fs.fstatSync(descriptor);
+    if (!opened.isFile() || opened.size > 1024 ||
+        opened.dev !== before.dev || opened.ino !== before.ino) {
+      return null;
+    }
+    return readBoundedUtf8(descriptor, 1024);
+  } catch {
+    return null;
+  } finally {
+    if (descriptor != null) {
+      try {
+        fs.closeSync(descriptor);
+      } catch {
+        // Ignore a descriptor already closed by a concurrent test shim.
+      }
+    }
+  }
+}
+
 export function loadBrokerSession(cwd) {
   return readBrokerStateFile(resolveBrokerStateFile(cwd));
 }
@@ -487,10 +541,10 @@ function applyEndedBrokerOwners(stateFile, session) {
     }
   }
   if (endedOwners.size === 0) {
-    return { session, markerFiles };
+    return { session, markerFiles, endedOwners };
   }
   if (!session) {
-    return { session, markerFiles };
+    return { session, markerFiles, endedOwners };
   }
   const owners = brokerSessionOwners(session).filter((owner) => !endedOwners.has(owner));
   return {
@@ -499,7 +553,8 @@ function applyEndedBrokerOwners(stateFile, session) {
       sessionId: owners[0] ?? null,
       sessionIds: owners
     },
-    markerFiles
+    markerFiles,
+    endedOwners
   };
 }
 
@@ -608,12 +663,28 @@ function discardBrokerSession(cwd, session, options) {
   clearBrokerSession(cwd);
 }
 
+function rejectEndedBrokerOwner(cwd, pending, sessionId, options) {
+  if (!sessionId || !pending.endedOwners.has(sessionId)) {
+    return;
+  }
+  const remainingOwners = brokerSessionOwners(pending.session);
+  if (pending.session && remainingOwners.length > 0) {
+    saveBrokerSession(cwd, pending.session);
+  } else {
+    discardBrokerSession(cwd, pending.session, options);
+  }
+  clearEndedOwnerMarkers(pending.markerFiles);
+  throw brokerOwnerEndedError(sessionId);
+}
+
 // Adopt cwd's recorded broker for this session if it is still live, else spawn
 // and persist a fresh one. Callers run this inside the state-file lock so two
 // racing sessions cannot each leave an orphaned broker with no broker.json.
 async function adoptOrSpawnBroker(cwd, options) {
   const stateFile = resolveBrokerStateFile(cwd);
+  const sessionId = resolveSessionId(options);
   const pending = applyEndedBrokerOwners(stateFile, loadBrokerSession(cwd));
+  rejectEndedBrokerOwner(cwd, pending, sessionId, options);
   const current = pending.session;
   if (current && (await isBrokerEndpointReady(current.endpoint))) {
     const withOwner = withBrokerSessionOwner(current, resolveSessionId(options));
@@ -628,11 +699,31 @@ async function adoptOrSpawnBroker(cwd, options) {
 
   const session = await spawnReadyBroker(cwd, options);
   if (!session) {
+    const markerFile = sessionId ? endedOwnerMarkerFile(stateFile, sessionId) : null;
+    if (markerFile && fs.existsSync(markerFile)) {
+      clearEndedOwnerMarkers([markerFile]);
+      throw brokerOwnerEndedError(sessionId);
+    }
     return null;
   }
-  const withOwner = withBrokerSessionOwner(session, session.sessionId);
-  saveBrokerSession(cwd, withOwner);
-  return withOwner;
+  const spawnedWithOwner = withBrokerSessionOwner(session, session.sessionId);
+  const pendingAfterSpawn = applyEndedBrokerOwners(stateFile, spawnedWithOwner);
+  const activeOwners = brokerSessionOwners(pendingAfterSpawn.session);
+  if (activeOwners.length === 0) {
+    teardownBrokerSession({
+      endpoint: session.endpoint,
+      pidFile: session.pidFile,
+      logFile: session.logFile,
+      sessionDir: session.sessionDir,
+      pid: session.pid,
+      killProcess: options.killProcess ?? null
+    });
+    clearEndedOwnerMarkers(pendingAfterSpawn.markerFiles);
+    throw brokerOwnerEndedError(session.sessionId);
+  }
+  saveBrokerSession(cwd, pendingAfterSpawn.session);
+  clearEndedOwnerMarkers(pendingAfterSpawn.markerFiles);
+  return pendingAfterSpawn.session;
 }
 
 export async function ensureBrokerSession(cwd, options = {}) {
@@ -649,6 +740,7 @@ export async function ensureBrokerSession(cwd, options = {}) {
     }
     const reused = await withBrokerStateFileLock(stateFile, () => {
       const pending = applyEndedBrokerOwners(stateFile, loadBrokerSession(cwd));
+      rejectEndedBrokerOwner(cwd, pending, resolveSessionId(options), options);
       const current = pending.session;
       if (!current || current.endpoint !== existing.endpoint) {
         return null;
@@ -670,7 +762,45 @@ export async function ensureBrokerSession(cwd, options = {}) {
   // Slow path: adopt-or-spawn under the lock so concurrent spawns don't orphan
   // brokers. resolveStateDir must exist before we can create the lock dir.
   fs.mkdirSync(resolveStateDir(cwd), { recursive: true });
-  return withBrokerStateFileLock(stateFile, () => adoptOrSpawnBroker(cwd, options), lockOptions);
+  return withBrokerStateFileLock(stateFile, () => adoptOrSpawnBroker(cwd, options), {
+    ...lockOptions,
+    ownerSessionId: resolveSessionId(options)
+  });
+}
+
+// Reuse cwd's recorded broker without claiming ownership or spawning a new
+// broker. Probe-only callers still have to honor ended-owner markers; reading
+// broker.json directly can otherwise let an ended session reconnect after its
+// teardown was deferred by lock contention.
+export async function reuseBrokerSession(cwd, options = {}) {
+  const stateFile = resolveBrokerStateFile(cwd);
+  // Always take the state lock, even when broker.json has not been published.
+  // SessionEnd can intentionally leave only an ended-owner marker when it
+  // races before the first broker lock; probe-only reuse must reconcile that
+  // marker before it is allowed to fall back to a direct app-server.
+  fs.mkdirSync(resolveStateDir(cwd), { recursive: true });
+  const lockOptions = options.lockTimeoutMs == null ? {} : { timeoutMs: options.lockTimeoutMs };
+  return withBrokerStateFileLock(stateFile, async () => {
+    const pending = applyEndedBrokerOwners(stateFile, loadBrokerSession(cwd));
+    rejectEndedBrokerOwner(cwd, pending, resolveSessionId(options), options);
+
+    const current = pending.session;
+    if (!current || brokerSessionOwners(current).length === 0) {
+      discardBrokerSession(cwd, current, options);
+      clearEndedOwnerMarkers(pending.markerFiles);
+      return null;
+    }
+    if (!(await isBrokerEndpointReady(current.endpoint))) {
+      discardBrokerSession(cwd, current, options);
+      clearEndedOwnerMarkers(pending.markerFiles);
+      return null;
+    }
+    if (pending.markerFiles.length > 0) {
+      saveBrokerSession(cwd, current);
+    }
+    clearEndedOwnerMarkers(pending.markerFiles);
+    return current;
+  }, lockOptions);
 }
 
 export async function teardownBrokerForCwd(
@@ -684,7 +814,14 @@ export async function teardownBrokerForCwd(
   } = {}
 ) {
   const stateFile = resolveBrokerStateFile(cwd);
-  if (!fs.existsSync(stateFile) && !fallbackSession) {
+  const lockDir = `${stateFile}.lock`;
+  if (!fs.existsSync(stateFile) && !fs.existsSync(lockDir) && !fallbackSession) {
+    if (sessionId) {
+      // Persist the end intent even before a concurrent first broker start has
+      // published its lock. The starter will reconcile this marker before it
+      // can spawn or persist ownership for the ended session.
+      recordEndedBrokerOwner(stateFile, sessionId);
+    }
     return false;
   }
   fs.mkdirSync(resolveStateDir(cwd), { recursive: true });
@@ -742,7 +879,7 @@ export async function teardownBrokerForCwd(
     );
   } catch (error) {
     if (isBrokerLockTimeout(error)) {
-      return false;
+      throw brokerCleanupIncompleteError("lock-timeout");
     }
     throw error;
   }
@@ -767,140 +904,168 @@ export async function teardownBrokersForSession(
   }
 
   const deadline = budgetMs != null ? Date.now() + budgetMs : null;
+  if (deadline != null && Date.now() >= deadline) {
+    throw brokerCleanupIncompleteError("deadline");
+  }
   let count = 0;
   let teardownError = null;
+  let incompleteReason = null;
   const excludedStateFile = excludeCwd ? resolveBrokerStateFile(excludeCwd) : null;
-  for (const entry of fs.readdirSync(stateRoot, { withFileTypes: true })) {
-    if (deadline != null && Date.now() >= deadline) {
-      break;
-    }
-    if (!entry.isDirectory() || entry.isSymbolicLink()) {
-      continue;
-    }
-    const stateFile = path.join(stateRoot, entry.name, BROKER_STATE_FILE);
-    if (stateFile === excludedStateFile) {
-      continue;
-    }
-    if (!fs.existsSync(stateFile)) {
-      continue;
-    }
+  const stateDirectory = fs.opendirSync(stateRoot);
+  try {
+    while (true) {
+      if (deadline != null && Date.now() >= deadline) {
+        incompleteReason = "deadline";
+        break;
+      }
+      const entry = stateDirectory.readSync();
+      if (!entry) {
+        break;
+      }
+      if (deadline != null && Date.now() >= deadline) {
+        incompleteReason = "deadline";
+        break;
+      }
+      if (!entry.isDirectory() || entry.isSymbolicLink()) {
+        continue;
+      }
+      const stateFile = path.join(stateRoot, entry.name, BROKER_STATE_FILE);
+      if (stateFile === excludedStateFile) {
+        continue;
+      }
+      const stateExists = fs.existsSync(stateFile);
+      const lockDir = `${stateFile}.lock`;
+      if (!stateExists && readBrokerLockSession(lockDir) !== sessionId) {
+        continue;
+      }
 
-    // Ownership pre-check without the lock: never block on a lock held for a
-    // workspace this session does not own. The owner set only ever grows to
-    // include our sessionId (reuse) or shrinks when we ourselves remove it, so
-    // an unlocked read cannot falsely exclude a broker we own. A parse failure
-    // (e.g. a genuinely corrupt file) is NOT treated as "not ours" — fall
-    // through to the locked re-read, which is authoritative, rather than
-    // skipping a broker that might belong to this session.
-    let preview = null;
-    try {
-      preview = readBrokerStateFile(stateFile);
-    } catch {
-      preview = null;
-    }
-    if (preview && !brokerSessionOwners(preview).includes(sessionId)) {
-      continue;
-    }
-    recordEndedBrokerOwner(stateFile, sessionId);
-
-    const remaining = deadline != null ? deadline - Date.now() : lockTimeoutMs;
-    if (remaining <= 0) {
-      break;
-    }
-    const entryLockTimeout = Math.min(lockTimeoutMs, remaining);
-
-    try {
-      await withBrokerStateFileLock(
-        stateFile,
-        async () => {
-          if (!fs.existsSync(stateFile)) {
-            return;
-          }
-
-          const pending = applyEndedBrokerOwners(stateFile, readBrokerStateFile(stateFile));
-          const session = pending.session;
-          if (!session) {
-            clearEndedOwnerMarkers(pending.markerFiles);
-            return;
-          }
-          const owners = brokerSessionOwners(session);
-          if (!owners.includes(sessionId)) {
-            if (pending.markerFiles.length > 0) {
-              if (owners.length === 0) {
-                if (session.endpoint) {
-                  const shutdownWait =
-                    deadline != null ? Math.min(shutdownTimeoutMs, deadline - Date.now()) : shutdownTimeoutMs;
-                  if (shutdownWait > 0) {
-                    await sendBrokerShutdown(session.endpoint, { timeoutMs: shutdownWait });
-                  }
-                }
-                teardownBrokerSession({
-                  endpoint: session.endpoint ?? null,
-                  pidFile: session.pidFile ?? null,
-                  logFile: session.logFile ?? null,
-                  sessionDir: session.sessionDir ?? null,
-                  pid: session.pid ?? null,
-                  killProcess
-                });
-                if (fs.existsSync(stateFile)) {
-                  fs.unlinkSync(stateFile);
-                }
-                count += 1;
-              } else {
-                writeBrokerStateFile(stateFile, session);
-              }
-              clearEndedOwnerMarkers(pending.markerFiles);
-            }
-            return;
-          }
-          const remainingOwners = owners.filter((owner) => owner !== sessionId);
-          if (remainingOwners.length > 0) {
-            writeBrokerStateFile(stateFile, {
-              ...session,
-              sessionId: remainingOwners[0],
-              sessionIds: remainingOwners
-            });
-            clearEndedOwnerMarkers(pending.markerFiles);
-            return;
-          }
-
-          // Bound the graceful-shutdown wait by the remaining scan budget, not
-          // just the per-RPC default: several unresponsive endpoints could
-          // otherwise each burn shutdownTimeoutMs and push the whole scan past
-          // the SessionEnd hook's budget. Out of budget → skip the RPC and let
-          // teardownBrokerSession terminate the process directly.
-          if (session.endpoint) {
-            const shutdownWait =
-              deadline != null ? Math.min(shutdownTimeoutMs, deadline - Date.now()) : shutdownTimeoutMs;
-            if (shutdownWait > 0) {
-              await sendBrokerShutdown(session.endpoint, { timeoutMs: shutdownWait });
-            }
-          }
-          teardownBrokerSession({
-            endpoint: session.endpoint ?? null,
-            pidFile: session.pidFile ?? null,
-            logFile: session.logFile ?? null,
-            sessionDir: session.sessionDir ?? null,
-            pid: session.pid ?? null,
-            killProcess
-          });
-          if (fs.existsSync(stateFile)) {
-            fs.unlinkSync(stateFile);
-          }
-          clearEndedOwnerMarkers(pending.markerFiles);
-          count += 1;
-        },
-        { timeoutMs: entryLockTimeout }
-      );
-    } catch (error) {
-      if (!isBrokerLockTimeout(error)) {
+      // Ownership pre-check without the lock: never block on a lock held for a
+      // workspace this session does not own. The owner set only ever grows to
+      // include our sessionId (reuse) or shrinks when we ourselves remove it, so
+      // an unlocked read cannot falsely exclude a broker we own. A parse failure
+      // (e.g. a genuinely corrupt file) is NOT treated as "not ours" — fall
+      // through to the locked re-read, which is authoritative, rather than
+      // skipping a broker that might belong to this session.
+      let preview = null;
+      if (stateExists) {
+        try {
+          preview = readBrokerStateFile(stateFile);
+        } catch {
+          preview = null;
+        }
+      }
+      if (preview && !brokerSessionOwners(preview).includes(sessionId)) {
+        continue;
+      }
+      try {
+        recordEndedBrokerOwner(stateFile, sessionId);
+      } catch (error) {
         teardownError ??= error;
         continue;
       }
-      // This entry's lock remained unavailable within the timeout. Skip it so
-      // the rest of this session's brokers still get torn down instead of
-      // aborting the whole scan.
+
+      const remaining = deadline != null ? deadline - Date.now() : lockTimeoutMs;
+      if (remaining <= 0) {
+        incompleteReason = "deadline";
+        break;
+      }
+      const entryLockTimeout = Math.min(lockTimeoutMs, remaining);
+
+      try {
+        await withBrokerStateFileLock(
+          stateFile,
+          async () => {
+            const pending = applyEndedBrokerOwners(stateFile, readBrokerStateFile(stateFile));
+            const session = pending.session;
+            if (!session) {
+              clearEndedOwnerMarkers(pending.markerFiles);
+              return;
+            }
+            const owners = brokerSessionOwners(session);
+            if (!owners.includes(sessionId)) {
+              if (pending.markerFiles.length > 0) {
+                if (owners.length === 0) {
+                  if (session.endpoint) {
+                    const shutdownWait =
+                      deadline != null ? Math.min(shutdownTimeoutMs, deadline - Date.now()) : shutdownTimeoutMs;
+                    if (shutdownWait > 0) {
+                      await sendBrokerShutdown(session.endpoint, { timeoutMs: shutdownWait });
+                    }
+                  }
+                  teardownBrokerSession({
+                    endpoint: session.endpoint ?? null,
+                    pidFile: session.pidFile ?? null,
+                    logFile: session.logFile ?? null,
+                    sessionDir: session.sessionDir ?? null,
+                    pid: session.pid ?? null,
+                    killProcess
+                  });
+                  if (fs.existsSync(stateFile)) {
+                    fs.unlinkSync(stateFile);
+                  }
+                  count += 1;
+                } else {
+                  writeBrokerStateFile(stateFile, session);
+                }
+                clearEndedOwnerMarkers(pending.markerFiles);
+              }
+              return;
+            }
+            const remainingOwners = owners.filter((owner) => owner !== sessionId);
+            if (remainingOwners.length > 0) {
+              writeBrokerStateFile(stateFile, {
+                ...session,
+                sessionId: remainingOwners[0],
+                sessionIds: remainingOwners
+              });
+              clearEndedOwnerMarkers(pending.markerFiles);
+              return;
+            }
+
+            // Bound the graceful-shutdown wait by the remaining scan budget, not
+            // just the per-RPC default: several unresponsive endpoints could
+            // otherwise each burn shutdownTimeoutMs and push the whole scan past
+            // the SessionEnd hook's budget. Out of budget → skip the RPC and let
+            // teardownBrokerSession terminate the process directly.
+            if (session.endpoint) {
+              const shutdownWait =
+                deadline != null ? Math.min(shutdownTimeoutMs, deadline - Date.now()) : shutdownTimeoutMs;
+              if (shutdownWait > 0) {
+                await sendBrokerShutdown(session.endpoint, { timeoutMs: shutdownWait });
+              }
+            }
+            teardownBrokerSession({
+              endpoint: session.endpoint ?? null,
+              pidFile: session.pidFile ?? null,
+              logFile: session.logFile ?? null,
+              sessionDir: session.sessionDir ?? null,
+              pid: session.pid ?? null,
+              killProcess
+            });
+            if (fs.existsSync(stateFile)) {
+              fs.unlinkSync(stateFile);
+            }
+            clearEndedOwnerMarkers(pending.markerFiles);
+            count += 1;
+          },
+          { timeoutMs: entryLockTimeout }
+        );
+      } catch (error) {
+        if (!isBrokerLockTimeout(error)) {
+          teardownError ??= error;
+          continue;
+        }
+        // This entry's lock remained unavailable within the timeout. Skip it so
+        // the rest of this session's brokers still get torn down instead of
+        // aborting the whole scan, but report that cleanup was incomplete.
+        incompleteReason ??= "lock-timeout";
+      }
     }
+  } finally {
+    stateDirectory.closeSync();
+  }
+  if (incompleteReason) {
+    throw brokerCleanupIncompleteError(incompleteReason, count, teardownError);
   }
   if (teardownError) {
     throw teardownError;

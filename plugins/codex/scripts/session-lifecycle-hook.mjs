@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { terminateProcessTree } from "./lib/process.mjs";
 import { BROKER_ENDPOINT_ENV } from "./lib/app-server.mjs";
 import {
+  BROKER_CLEANUP_INCOMPLETE_CODE,
   LOG_FILE_ENV,
   PID_FILE_ENV,
   teardownBrokerForCwd,
@@ -24,8 +25,14 @@ const PLUGIN_DATA_ENV = "CLAUDE_PLUGIN_DATA";
 // teardown so the cwd fallback retains time before the hook is killed.
 const SESSION_END_CLEANUP_BUDGET_MS = 3000;
 const SESSION_END_LOCK_TIMEOUT_MS = 750;
-const MAX_SESSION_JOB_STATE_FILES = 1000;
 const MAX_SESSION_JOB_STATE_BYTES = 1024 * 1024;
+
+function cleanupIncompleteError(reason) {
+  return Object.assign(new Error(`Session cleanup stopped before scanning all job state: ${reason}.`), {
+    code: BROKER_CLEANUP_INCOMPLETE_CODE,
+    reason
+  });
+}
 
 function readHookInput() {
   const raw = fs.readFileSync(0, "utf8").trim();
@@ -121,14 +128,12 @@ function findSessionJobWorkspaces(cwd, sessionId, deadline) {
   let complete = true;
   let exhausted = false;
   try {
-    let scanned = 0;
-    while (scanned < MAX_SESSION_JOB_STATE_FILES && Date.now() < deadline) {
+    while (Date.now() < deadline) {
       const entry = stateDirectory.readSync();
       if (!entry) {
         exhausted = true;
         break;
       }
-      scanned += 1;
       if (entry.isSymbolicLink()) {
         complete = false;
         continue;
@@ -164,11 +169,16 @@ function cleanupSessionJobs(cwd, sessionId, deadline) {
   let cwdBrokerTeardownSafe = true;
   let workspaceIndex = 0;
   const discovery = findSessionJobWorkspaces(cwd, sessionId, deadline);
+  if (!discovery.complete) {
+    cleanupError = cleanupIncompleteError("job-discovery-incomplete");
+  }
   for (const workspaceRoot of discovery.workspaceRoots) {
     // Always clean the hook cwd first. Bound additional workspace cleanup by
     // the shared SessionEnd deadline so broker cleanup and the cwd fallback
     // retain time inside the hook's 5-second limit.
     if (workspaceIndex > 0 && Date.now() >= deadline) {
+      jobCleanupComplete = false;
+      cleanupError ??= cleanupIncompleteError("job-cleanup-deadline");
       break;
     }
     workspaceIndex += 1;
@@ -177,6 +187,7 @@ function cleanupSessionJobs(cwd, sessionId, deadline) {
       cleanupError ??= cleanup.error;
       if (!cleanup.brokerTeardownSafe) {
         jobCleanupComplete = false;
+        cleanupError ??= cleanupIncompleteError("job-state-incomplete");
         if (workspaceIndex === 1) {
           cwdBrokerTeardownSafe = false;
         }
@@ -234,17 +245,21 @@ export async function handleSessionEnd(input) {
   }
 
   if (cwdBrokerTeardownSafe) {
-    await teardownBrokerForCwd(cwd, sessionId, {
-      fallbackSession: process.env[BROKER_ENDPOINT_ENV]
-        ? {
-            endpoint: process.env[BROKER_ENDPOINT_ENV],
-            pidFile: process.env[PID_FILE_ENV] ?? null,
-            logFile: process.env[LOG_FILE_ENV] ?? null
-          }
-        : null,
-      killProcess: terminateProcessTree,
-      lockTimeoutMs: SESSION_END_LOCK_TIMEOUT_MS
-    });
+    try {
+      await teardownBrokerForCwd(cwd, sessionId, {
+        fallbackSession: process.env[BROKER_ENDPOINT_ENV]
+          ? {
+              endpoint: process.env[BROKER_ENDPOINT_ENV],
+              pidFile: process.env[PID_FILE_ENV] ?? null,
+              logFile: process.env[LOG_FILE_ENV] ?? null
+            }
+          : null,
+        killProcess: terminateProcessTree,
+        lockTimeoutMs: SESSION_END_LOCK_TIMEOUT_MS
+      });
+    } catch (error) {
+      cleanupError ??= error;
+    }
   }
   if (cleanupError) {
     throw cleanupError;
