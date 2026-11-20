@@ -15,9 +15,13 @@ import {
   teardownBrokerForCwd,
   teardownBrokersForSession
 } from "./lib/broker-lifecycle.mjs";
-import { removeSessionJobs, resolveStateFile, resolveStateRoot } from "./lib/state.mjs";
+import {
+  removeSessionJobsFromFile,
+  resolveStateFile,
+  resolveStateRoot,
+  stateDirForWorkspaceRoot
+} from "./lib/state.mjs";
 import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
-import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
 const PLUGIN_DATA_ENV = "CLAUDE_PLUGIN_DATA";
@@ -54,8 +58,7 @@ function appendEnvVar(name, value) {
   fs.appendFileSync(process.env.CLAUDE_ENV_FILE, `export ${name}=${shellEscape(value)}\n`, "utf8");
 }
 
-function cleanupWorkspaceSessionJobs(workspaceRoot, sessionId, deadline) {
-  const stateFile = resolveStateFile(workspaceRoot);
+function cleanupWorkspaceSessionJobs(stateFile, sessionId, deadline) {
   if (!fs.existsSync(stateFile)) {
     return { brokerTeardownSafe: true, error: null };
   }
@@ -65,8 +68,8 @@ function cleanupWorkspaceSessionJobs(workspaceRoot, sessionId, deadline) {
 
   let reachedTerminationPhase = false;
   try {
-    removeSessionJobs(
-      workspaceRoot,
+    removeSessionJobsFromFile(
+      stateFile,
       sessionId,
       {
         timeoutMs: Math.max(0, deadline - Date.now()),
@@ -118,11 +121,11 @@ function readSessionJobsFromStateFile(stateFile) {
   }
 }
 
-function findSessionJobWorkspaces(cwd, sessionId, deadline) {
-  const workspaceRoots = new Set([resolveWorkspaceRoot(cwd)]);
+function findSessionJobStateFiles(cwd, sessionId, deadline) {
+  const stateFiles = new Set([resolveStateFile(cwd)]);
   const stateRoot = resolveStateRoot();
   if (!fs.existsSync(stateRoot)) {
-    return { workspaceRoots, complete: true };
+    return { stateFiles, complete: true };
   }
 
   const stateDirectory = fs.opendirSync(stateRoot);
@@ -142,13 +145,20 @@ function findSessionJobWorkspaces(cwd, sessionId, deadline) {
       if (!entry.isDirectory()) {
         continue;
       }
-      const stateFile = path.join(stateRoot, entry.name, "state.json");
+      const stateDir = path.join(stateRoot, entry.name);
+      const stateFile = path.join(stateDir, "state.json");
       const state = readSessionJobsFromStateFile(stateFile);
       complete &&= state.complete;
-      for (const job of state.jobs) {
-        if (job.sessionId === sessionId && typeof job.workspaceRoot === "string" && job.workspaceRoot) {
-          workspaceRoots.add(job.workspaceRoot);
-        }
+      // Jobs already record the Git root. Resolving it with Git again is both
+      // expensive and unreliable once a worktree has been removed.
+      const ownedHere = state.jobs.some((job) =>
+        job.sessionId === sessionId &&
+        typeof job.workspaceRoot === "string" &&
+        job.workspaceRoot &&
+        stateDirForWorkspaceRoot(job.workspaceRoot) === stateDir
+      );
+      if (ownedHere) {
+        stateFiles.add(stateFile);
       }
     }
     if (!exhausted) {
@@ -157,7 +167,7 @@ function findSessionJobWorkspaces(cwd, sessionId, deadline) {
   } finally {
     stateDirectory.closeSync();
   }
-  return { workspaceRoots, complete };
+  return { stateFiles, complete };
 }
 
 function cleanupSessionJobs(cwd, sessionId, deadline) {
@@ -169,11 +179,11 @@ function cleanupSessionJobs(cwd, sessionId, deadline) {
   let jobCleanupComplete = true;
   let cwdBrokerTeardownSafe = true;
   let workspaceIndex = 0;
-  const discovery = findSessionJobWorkspaces(cwd, sessionId, deadline);
+  const discovery = findSessionJobStateFiles(cwd, sessionId, deadline);
   if (!discovery.complete) {
     cleanupError = cleanupIncompleteError("job-discovery-incomplete");
   }
-  for (const workspaceRoot of discovery.workspaceRoots) {
+  for (const stateFile of discovery.stateFiles) {
     // Always clean the hook cwd first. Bound additional workspace cleanup by
     // the shared SessionEnd deadline so broker cleanup and the cwd fallback
     // retain time inside the hook's 5-second limit.
@@ -184,7 +194,7 @@ function cleanupSessionJobs(cwd, sessionId, deadline) {
     }
     workspaceIndex += 1;
     try {
-      const cleanup = cleanupWorkspaceSessionJobs(workspaceRoot, sessionId, deadline);
+      const cleanup = cleanupWorkspaceSessionJobs(stateFile, sessionId, deadline);
       cleanupError ??= cleanup.error;
       if (!cleanup.brokerTeardownSafe) {
         jobCleanupComplete = false;

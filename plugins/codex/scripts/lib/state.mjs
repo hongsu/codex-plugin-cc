@@ -132,8 +132,7 @@ function releaseOwnedStateLock(lockDir, token) {
   }
 }
 
-function withStateFileLock(cwd, fn, { timeoutMs = STATE_LOCK_TIMEOUT_MS } = {}) {
-  const stateFile = resolveStateFile(cwd);
+function withStateFileLock(stateFile, fn, { timeoutMs = STATE_LOCK_TIMEOUT_MS } = {}) {
   const lockDir = `${stateFile}.lock`;
   const tokenFile = path.join(lockDir, "owner");
   const token = `${process.pid}-${stateWriteSequence += 1}`;
@@ -264,7 +263,10 @@ export function resolveStateRoot() {
 }
 
 export function resolveStateDir(cwd) {
-  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  return stateDirForWorkspaceRoot(resolveWorkspaceRoot(cwd));
+}
+
+export function stateDirForWorkspaceRoot(workspaceRoot) {
   let canonicalWorkspaceRoot = workspaceRoot;
   try {
     canonicalWorkspaceRoot = fs.realpathSync.native(workspaceRoot);
@@ -292,7 +294,10 @@ export function ensureStateDir(cwd) {
 }
 
 export function loadState(cwd) {
-  const stateFile = resolveStateFile(cwd);
+  return loadStateFile(resolveStateFile(cwd));
+}
+
+function loadStateFile(stateFile) {
   if (!fs.existsSync(stateFile)) {
     return defaultState();
   }
@@ -325,9 +330,10 @@ function removeFileIfExists(filePath) {
   }
 }
 
-function saveStateUnlocked(cwd, state) {
-  const previousJobs = loadState(cwd).jobs;
-  ensureStateDir(cwd);
+function saveStateUnlocked(stateFile, state) {
+  const previousJobs = loadStateFile(stateFile).jobs;
+  const jobsDir = path.join(path.dirname(stateFile), JOBS_DIR_NAME);
+  fs.mkdirSync(jobsDir, { recursive: true });
   const nextJobs = pruneJobs(state.jobs ?? []);
   const nextState = {
     version: STATE_VERSION,
@@ -343,11 +349,10 @@ function saveStateUnlocked(cwd, state) {
     if (retainedIds.has(job.id)) {
       continue;
     }
-    removeJobFile(resolveJobFile(cwd, job.id));
+    removeJobFile(path.join(jobsDir, `${job.id}.json`));
     removeFileIfExists(job.logFile);
   }
 
-  const stateFile = resolveStateFile(cwd);
   const temporaryStateFile = `${stateFile}.tmp-${process.pid}-${stateWriteSequence += 1}`;
   try {
     fs.writeFileSync(temporaryStateFile, `${JSON.stringify(nextState, null, 2)}\n`, "utf8");
@@ -359,27 +364,33 @@ function saveStateUnlocked(cwd, state) {
 }
 
 export function saveState(cwd, state) {
-  return withStateFileLock(cwd, () => saveStateUnlocked(cwd, state));
+  const stateFile = resolveStateFile(cwd);
+  return withStateFileLock(stateFile, () => saveStateUnlocked(stateFile, state));
 }
 
 export function updateState(cwd, mutate) {
-  return withStateFileLock(cwd, () => {
-    const state = loadState(cwd);
+  const stateFile = resolveStateFile(cwd);
+  return withStateFileLock(stateFile, () => {
+    const state = loadStateFile(stateFile);
     mutate(state);
-    return saveStateUnlocked(cwd, state);
+    return saveStateUnlocked(stateFile, state);
   });
 }
 
 export function removeSessionJobs(cwd, sessionId, options = {}) {
+  return removeSessionJobsFromFile(resolveStateFile(cwd), sessionId, options);
+}
+
+export function removeSessionJobsFromFile(stateFile, sessionId, options = {}) {
   const { beforeRemove = () => {}, ...lockOptions } = options;
-  return withStateFileLock(cwd, () => {
-    const state = loadState(cwd);
+  return withStateFileLock(stateFile, () => {
+    const state = loadStateFile(stateFile);
     const removedJobs = state.jobs.filter((job) => job.sessionId === sessionId);
     if (removedJobs.length === 0) {
       return [];
     }
     beforeRemove(removedJobs);
-    saveStateUnlocked(cwd, {
+    saveStateUnlocked(stateFile, {
       ...state,
       jobs: state.jobs.filter((job) => job.sessionId !== sessionId)
     });

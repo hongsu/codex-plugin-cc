@@ -7,7 +7,7 @@ import { pathToFileURL } from "node:url";
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { makeTempDir } from "./helpers.mjs";
+import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 import { createBrokerEndpoint, parseBrokerEndpoint } from "../plugins/codex/scripts/lib/broker-endpoint.mjs";
 import {
   loadState,
@@ -448,7 +448,9 @@ test("handleSessionEnd still tears down session brokers when job cleanup fails",
     );
 
     try {
-      await assert.rejects(() => handleSessionEnd({ cwd, session_id: "S" }), { code: "EISDIR" });
+      await assert.rejects(() => handleSessionEnd({ cwd, session_id: "S" }), {
+        code: /^(EISDIR|EPERM)$/, syscall: "unlink", path: badLogFile
+      });
     } finally {
       process.kill = originalKill;
     }
@@ -604,12 +606,43 @@ test("handleSessionEnd continues cross-cwd cleanup after one workspace cleanup f
       sessionIds: ["S"]
     });
 
-    await assert.rejects(() => handleSessionEnd({ cwd: hookCwd, session_id: "S" }), { code: "EISDIR" });
+    await assert.rejects(() => handleSessionEnd({ cwd: hookCwd, session_id: "S" }), {
+      code: /^(EISDIR|EPERM)$/, syscall: "unlink", path: badLog
+    });
 
     assert.deepEqual(loadState(otherWorkspace).jobs, []);
     assert.equal(fs.existsSync(resolveJobFile(otherWorkspace, otherJobId)), false);
     assert.equal(fs.existsSync(otherLog), false);
     assert.equal(loadBrokerSession(otherWorkspace), null);
+  });
+});
+
+test("SessionEnd cleans discovered state when a former worktree now resolves to the parent repo", async () => {
+  await withPluginData(async () => {
+    const repo = makeTempDir();
+    const worktree = path.join(repo, "worker");
+    initGitRepo(repo);
+    assert.equal(run("git", ["commit", "--allow-empty", "-m", "fixture"], { cwd: repo }).status, 0);
+    assert.equal(run("git", ["worktree", "add", "--detach", worktree], { cwd: repo }).status, 0);
+    const stateFile = resolveStateFile(worktree);
+    const brokerFile = path.join(path.dirname(stateFile), "broker.json");
+    saveState(worktree, {
+      jobs: ["ending", "survivor"].map((sessionId) => ({
+        id: sessionId,
+        sessionId,
+        workspaceRoot: worktree,
+        status: "completed"
+      }))
+    });
+    saveBrokerSession(worktree, { sessionIds: ["ending", "survivor"] });
+
+    assert.equal(run("git", ["worktree", "remove", worktree], { cwd: repo }).status, 0);
+    fs.mkdirSync(worktree);
+    assert.equal(resolveStateFile(worktree), resolveStateFile(repo));
+    await handleSessionEnd({ cwd: repo, session_id: "ending" });
+
+    assert.deepEqual(JSON.parse(fs.readFileSync(stateFile, "utf8")).jobs.map((j) => j.id), ["survivor"]);
+    assert.deepEqual(JSON.parse(fs.readFileSync(brokerFile, "utf8")).sessionIds, ["survivor"]);
   });
 });
 
